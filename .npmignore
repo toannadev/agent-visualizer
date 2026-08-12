@@ -1,0 +1,15 @@
+node_modules
+data
+.next
+.git
+.claude
+.env
+.env.*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*.secret
+package-lock.json

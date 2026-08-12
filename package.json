@@ -1,0 +1,33 @@
+{
+  "name": "agent-visualizer",
+  "version": "0.1.0",
+  "description": "Realtime Agent Visualizer — execution graph, file heatmap, message log, and metrics for Claude Code and Codex.",
+  "type": "module",
+  "bin": {
+    "visualizer": "./bin/visualizer.mjs"
+  },
+  "files": [
+    "bin/",
+    "server/",
+    "public/",
+    "scripts/",
+    "SKILL.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/bundle-d3.mjs",
+    "prepare": "npm run build",
+    "prepublishOnly": "node scripts/bundle-d3.mjs",
+    "postinstall": "node bin/visualizer.mjs install-skill",
+    "start": "node bin/visualizer.mjs",
+    "patch-hooks": "node scripts/patch-hooks.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "d3-force": "^3.0.0"
+  },
+  "license": "MIT"
+}

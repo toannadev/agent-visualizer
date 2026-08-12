@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Runtime data and logs
+data/
+*.log
+*.pid
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Build/cache output
+.next/
+.cache/
+coverage/
+
+# Local package artifacts
+*.tgz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local Claude configuration
+.claude/
+
+# Credential and certificate files
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*.secret

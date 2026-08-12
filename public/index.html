@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Visualizer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span class="dot">✦</span> Agent Visualizer
+        <small id="session-count">0 session</small>
+      </div>
+      <div id="sidebar" class="sidebar-list"></div>
+    </aside>
+    <section class="main-content">
+      <div class="rt-tabs">
+        <button class="rt-tab active" data-tab="sessions">Sessions</button>
+        <button class="rt-tab" data-tab="replay">Replay</button>
+        <span class="rt-right">
+          <span id="rt-error" class="rt-err" hidden></span>
+          <span id="rt-updated" class="rt-updated muted" hidden></span>
+          <span id="rt-live" class="rt-live" hidden><span class="rt-live-dot"></span> live</span>
+        </span>
+      </div>
+      <div id="view-sessions">
+        <div id="detail"></div>
+      </div>
+      <div id="view-replay" hidden></div>
+    </section>
+  </div>
+  <script src="d3-quadtree.min.js"></script>
+  <script src="d3-dispatch.min.js"></script>
+  <script src="d3-timer.min.js"></script>
+  <script src="d3.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
