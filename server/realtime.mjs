@@ -10,6 +10,10 @@ import { fileURLToPath } from "node:url";
 import { recompute } from "./visual.mjs";
 import { findRolloutPaths, readCodexRollout, readCodexRolloutFull, sessionIdFromPath } from "./codex.mjs";
 import { readTranscript, redactString } from "./transcript.mjs";
+import {
+  findGrokUpdatePaths, grokSessionIdFromPath, readGrokSummary, toIsoTs,
+  grokContentText, grokToolName, grokFileRefs, grokOutputText, inferRuntime,
+} from "./grok.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -60,15 +64,16 @@ function encodeCwd(cwd) {
 function fileToId(filePath, runtime) {
   const base = path.basename(filePath).replace(/\.jsonl$/, "");
   if (runtime === "codex") return sessionIdFromPath(filePath);
+  if (runtime === "grok") return grokSessionIdFromPath(filePath);
   return base; // claude: basename = session id
 }
 
-function seedSession(runtime, id, { cwd = "", filePath = "" } = {}) {
+function seedSession(runtime, id, { cwd = "", filePath = "", title = "", model = "", startedAt = "" } = {}) {
   return {
     meta: {
-      runtime, id, source: "live", path: filePath, cwd,
+      runtime, id, source: "live", path: filePath, cwd, title, model,
       projectDir: runtime === "codex" ? path.dirname(filePath).split(CODEX_ROOT + "/")[1] || "" : encodeCwd(cwd),
-      startedAt: new Date().toISOString(), endedAt: null,
+      startedAt: startedAt || new Date().toISOString(), endedAt: null,
       status: "running", mtimeMs: Date.now(), sizeBytes: 0,
     },
     events: [], graph: { nodes: [], links: [] }, timeline: [], heatmap: [], messages: [],
@@ -137,7 +142,7 @@ function ingestClaudeHook(b) {
 }
 
 function hookToVisualEvent(b, seq, sid) {
-  const ts = new Date().toISOString();
+  const ts = toIsoTs(new Date().toISOString());
   const base = { runtime: "claude", sessionId: sid, ts, seq, parentId: null };
   switch (b.hook_event_name) {
     case "SessionStart":
@@ -186,11 +191,46 @@ function fileRefsFromHook(b) {
   return refs;
 }
 
+// Codex writes the same turn twice: event_msg + response_item. It also injects
+// environment/system blobs as role=user, and repeats the last reply on task_complete.
+const SYNTHETIC_CODEX_TEXT = /<(environment_context|turn_aborted|skills_instructions|permissions instructions|collaboration_mode)\b/i;
+
+function normEventText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function isSyntheticCodexText(text) {
+  const t = String(text || "").trim();
+  return !t || SYNTHETIC_CODEX_TEXT.test(t);
+}
+
+function hasSimilarEvent(s, kind, turnId, text) {
+  const needle = normEventText(text);
+  if (!needle) return true;
+  return s.events.some((e) =>
+    e.kind === kind &&
+    (!turnId || e.turnId === turnId) &&
+    normEventText(e.detail || e.label) === needle
+  );
+}
+
+function pushCodexMessage(s, ev) {
+  if (isSyntheticCodexText(ev.detail || ev.label)) return;
+  if (hasSimilarEvent(s, ev.kind, ev.turnId, ev.detail || ev.label)) return;
+  pushEvent(s, ev);
+}
+
+function codexErrorMessage(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  return err.message || err.codex_error_info || JSON.stringify(err);
+}
+
 // ---------- Codex ingestion ----------
 function ingestCodexLine(obj, filePath, seq) {
   const sid = sessionIdFromPath(filePath);
   let s = sessions.get(sid) || seedSession("codex", sid, { filePath });
-  const ts = obj.timestamp || new Date().toISOString();
+  const ts = toIsoTs(obj.timestamp);
   const base = { runtime: "codex", sessionId: sid, ts, seq, parentId: null };
 
   if (obj.type === "session_meta") {
@@ -215,14 +255,14 @@ function ingestCodexLine(obj, filePath, seq) {
     const p = obj.payload || {};
     switch (p.type) {
       case "task_started":
+        // Lifecycle only — the real turn starts at the user prompt.
         s._curTurn = p.turn_id || s._curTurn;
-        pushEvent(s, { ...base, kind: "agent_message", id: `cts${seq}`, turnId: p.turn_id, label: "▶ turn started", detail: `context window: ${p.model_context_window}`, phase: "commentary" });
         break;
       case "user_message":
-        pushEvent(s, { ...base, kind: "user_prompt", id: `cum${seq}`, turnId: s._curTurn, label: String(p.message || "").slice(0, 140), detail: p.message });
+        pushCodexMessage(s, { ...base, kind: "user_prompt", id: `cum${seq}`, turnId: s._curTurn, label: String(p.message || "").slice(0, 140), detail: p.message });
         break;
       case "agent_message":
-        pushEvent(s, { ...base, kind: "agent_message", id: `cam${seq}`, turnId: s._curTurn, label: String(p.message || "").slice(0, 140), detail: p.message, phase: p.phase === "final_answer" ? "final_answer" : "commentary" });
+        pushCodexMessage(s, { ...base, kind: "agent_message", id: `cam${seq}`, turnId: s._curTurn, label: String(p.message || "").slice(0, 140), detail: p.message, phase: p.phase === "final_answer" ? "final_answer" : "commentary" });
         break;
       case "token_count": {
         const u = p.info?.total_token_usage || {};
@@ -238,9 +278,22 @@ function ingestCodexLine(obj, filePath, seq) {
       case "turn_aborted":
         pushEvent(s, { ...base, kind: "agent_message", id: `cta${seq}`, turnId: p.turn_id, label: `⏹ turn aborted · ${p.reason || ""}`, detail: `duration ${Math.round((p.duration_ms || 0) / 1000)}s`, phase: "final_answer" });
         break;
-      case "task_complete":
-        pushEvent(s, { ...base, kind: "agent_message", id: `ctc${seq}`, turnId: p.turn_id, label: String(p.last_agent_message || "complete").slice(0, 140), detail: p.last_agent_message, phase: "final_answer" });
+      case "task_complete": {
+        const errMsg = codexErrorMessage(p.error);
+        if (errMsg) {
+          const code = (typeof p.error === "object" && p.error?.codex_error_info) || "turn";
+          pushEvent(s, {
+            ...base, kind: "tool_error", id: `cte${seq}`, turnId: p.turn_id,
+            toolName: code, label: errMsg.slice(0, 140), detail: errMsg, error: errMsg,
+          });
+          break;
+        }
+        // The last assistant response_item already carries this text.
+        if (p.last_agent_message) {
+          pushCodexMessage(s, { ...base, kind: "agent_message", id: `ctc${seq}`, turnId: p.turn_id, label: String(p.last_agent_message).slice(0, 140), detail: p.last_agent_message, phase: "final_answer" });
+        }
         break;
+      }
       default: break; // thread_settings_applied → skip
     }
     return s;
@@ -259,9 +312,9 @@ function ingestCodexLine(obj, filePath, seq) {
         const text = Array.isArray(p.content) ? p.content.filter((c) => c?.text).map((c) => c.text).join("\n") : "";
         if (!text) break;
         if (p.role === "user") {
-          pushEvent(s, { ...base, kind: "user_prompt", id: `cm${seq}`, turnId: turnId, label: text.slice(0, 140), detail: text });
+          pushCodexMessage(s, { ...base, kind: "user_prompt", id: `cm${seq}`, turnId: turnId, label: text.slice(0, 140), detail: text });
         } else {
-          pushEvent(s, { ...base, kind: "agent_message", id: `cm${seq}`, turnId: turnId, label: text.slice(0, 140), detail: text, phase: p.phase === "final_answer" ? "final_answer" : "commentary" });
+          pushCodexMessage(s, { ...base, kind: "agent_message", id: `cm${seq}`, turnId: turnId, label: text.slice(0, 140), detail: text, phase: p.phase === "final_answer" ? "final_answer" : "commentary" });
         }
         break;
       }
@@ -299,6 +352,136 @@ function codexFileRefs(name, input) {
   return refs;
 }
 
+function seedGrokSession(filePath) {
+  const sid = grokSessionIdFromPath(filePath);
+  const existing = sessions.get(sid);
+  if (existing) return existing;
+  const summary = readGrokSummary(path.dirname(filePath));
+  const s = seedSession("grok", sid, {
+    filePath,
+    cwd: summary?.cwd || "",
+    title: summary?.title || "",
+    model: summary?.model || "",
+    startedAt: summary?.createdAt ? toIsoTs(summary.createdAt) : "",
+  });
+  return s;
+}
+
+function appendGrokChunk(s, ev) {
+  const last = s.events[s.events.length - 1];
+  const samePrompt = ev._promptIndex == null || last?._promptIndex === ev._promptIndex;
+  if (last && last.kind === ev.kind && last._chunk && samePrompt) {
+    last.detail = `${last.detail || ""}${ev.detail || ""}`;
+    last.label = String(last.detail).slice(0, 140);
+    last.ts = ev.ts;
+    recomputeSession(s);
+    s.meta.mtimeMs = Date.now();
+    return;
+  }
+  pushEvent(s, ev);
+}
+
+function ingestGrokLine(obj, filePath, seq) {
+  const sid = grokSessionIdFromPath(filePath);
+  let s = sessions.get(sid) || seedGrokSession(filePath);
+  const ts = toIsoTs(obj.timestamp);
+  const base = { runtime: "grok", sessionId: sid, ts, seq, parentId: null };
+  const update = obj.params?.update;
+  if (!update || typeof update !== "object") return s;
+
+  const kind = update.sessionUpdate;
+  switch (kind) {
+    case "hook_execution":
+      if (update.event_name === "session_start" && !s.events.some((e) => e.kind === "session_start")) {
+        pushEvent(s, { ...base, kind: "session_start", id: `gs${seq}`, label: "started" });
+      }
+      break;
+    case "user_message_chunk": {
+      const text = grokContentText(update.content);
+      if (!text) break;
+      appendGrokChunk(s, {
+        ...base, kind: "user_prompt", id: `gu${seq}`,
+        label: text.slice(0, 140), detail: text, _chunk: true,
+        _promptIndex: update._meta?.promptIndex,
+        turnId: update._meta?.promptIndex != null ? `p${update._meta.promptIndex}` : undefined,
+      });
+      break;
+    }
+    case "agent_thought_chunk": {
+      const text = grokContentText(update.content);
+      if (!text) break;
+      appendGrokChunk(s, { ...base, kind: "reasoning", id: `gth${seq}`, label: "🧠 reasoning", detail: text, _chunk: true });
+      break;
+    }
+    case "agent_message_chunk": {
+      const text = grokContentText(update.content);
+      if (!text) break;
+      appendGrokChunk(s, { ...base, kind: "agent_message", id: `ga${seq}`, label: text.slice(0, 140), detail: text, _chunk: true });
+      break;
+    }
+    case "tool_call": {
+      const name = grokToolName(update);
+      const isSub = /^(spawn_subagent|subagent)$/i.test(name);
+      pushEvent(s, {
+        ...base,
+        kind: isSub ? "subagent_start" : "tool_call",
+        id: `gt${seq}`,
+        toolUseId: update.toolCallId,
+        toolName: name,
+        agentId: isSub ? update.toolCallId : undefined,
+        label: name,
+        detail: JSON.stringify(update.rawInput || {}).slice(0, 600),
+        filePaths: grokFileRefs(update),
+      });
+      break;
+    }
+    case "tool_call_update": {
+      if (update.status !== "completed" && update.status !== "failed") {
+        const existing = update.toolCallId
+          ? s.events.find((e) => e.toolUseId === update.toolCallId && e.kind === "tool_call")
+          : null;
+        if (existing) {
+          const refs = grokFileRefs(update);
+          if (refs.length) existing.filePaths = [...(existing.filePaths || []), ...refs];
+          if (update.title && !existing.detail) existing.detail = update.title;
+        }
+        break;
+      }
+      const text = grokOutputText(update);
+      const failed = update.status === "failed";
+      pushEvent(s, {
+        ...base,
+        kind: failed ? "tool_error" : "tool_output",
+        id: `go${seq}`,
+        toolUseId: update.toolCallId,
+        toolName: grokToolName(update),
+        label: failed ? "✗" : "✓",
+        detail: String(text).slice(0, 500),
+        error: failed ? String(text).slice(0, 300) : undefined,
+      });
+      break;
+    }
+    case "turn_completed": {
+      const u = update.usage || {};
+      if (u.totalTokens || u.inputTokens) {
+        const last = s.events[s.events.length - 1];
+        if (last) last.tokens = {
+          input: u.inputTokens || 0,
+          output: u.outputTokens || 0,
+          reasoning: u.reasoningTokens,
+          cacheRead: u.cachedReadTokens,
+          total: u.totalTokens || (u.inputTokens || 0) + (u.outputTokens || 0),
+        };
+        recomputeSession(s);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return s;
+}
+
 // ---------- tail watcher ----------
 const TAIL_MS = 800;
 let watcherTimer = null;
@@ -333,6 +516,9 @@ function tailTick() {
 
   // 2) Codex rollouts
   for (const fp of findRolloutPaths()) tailFile(fp, "codex");
+
+  // 3) Grok sessions (updates.jsonl)
+  for (const fp of findGrokUpdatePaths()) tailFile(fp, "grok");
 }
 
 function tailFile(filePath, runtime) {
@@ -381,6 +567,8 @@ function tailFile(filePath, runtime) {
     try { obj = JSON.parse(line); } catch { continue; } // partial mid-write
     if (runtime === "codex") {
       s = ingestCodexLine(obj, filePath, s ? s.events.length : 0) || s;
+    } else if (runtime === "grok") {
+      s = ingestGrokLine(obj, filePath, s ? s.events.length : 0) || s;
     } else {
       s = ingestClaudeLine(obj, filePath, s ? s.events.length : 0, id) || s;
     }
@@ -389,6 +577,8 @@ function tailFile(filePath, runtime) {
     s.meta.mtimeMs = st.mtimeMs;
     s.meta.sizeBytes = st.size;
     s.meta.status = isRecentlyActive(st.mtimeMs) || s.meta.status === "error" ? "running" : "idle";
+    const firstTs = s.events[0]?.ts;
+    if (firstTs && (!s.meta.startedAt || s.meta.startedAt > firstTs)) s.meta.startedAt = firstTs;
     sessions.set(id, s);
     emitUpsert(id);
   }
@@ -398,7 +588,7 @@ function tailFile(filePath, runtime) {
 function ingestClaudeLine(obj, filePath, seq, sid) {
   let s = sessions.get(sid) || seedSession("claude", sid, { filePath });
   if (obj.cwd && !s.meta.cwd) s.meta.cwd = obj.cwd;
-  const ts = obj.timestamp || new Date().toISOString();
+  const ts = toIsoTs(obj.timestamp);
   const base = { runtime: "claude", sessionId: sid, ts, seq, parentId: obj.parentUuid || null };
   let ev = null;
 
@@ -494,7 +684,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const b = JSON.parse(body || "{}");
           const filePath = b.path;
-          const runtime = b.runtime || (filePath.includes(".codex") ? "codex" : "claude");
+          const runtime = b.runtime || inferRuntime(filePath);
           ensureWatched(filePath, runtime);
             // Parse the complete file immediately for replay.
           if (runtime === "codex") {
@@ -502,6 +692,16 @@ const server = http.createServer(async (req, res) => {
             const sid = sessionIdFromPath(filePath);
             let s = sessions.get(sid) || seedSession("codex", sid, { filePath });
             for (const ev of events) s = ingestCodexLine(ev, filePath, s ? s.events.length : 0) || s;
+            s.meta.sizeBytes = size;
+            s.meta.source = "file";
+            sessions.set(sid, s);
+            emitUpsert(sid);
+            return sendJson(res, 200, { ok: true, id: sid });
+          } else if (runtime === "grok") {
+            const { events, size } = readCodexRolloutFull(filePath);
+            const sid = grokSessionIdFromPath(filePath);
+            let s = sessions.get(sid) || seedGrokSession(filePath);
+            for (const ev of events) s = ingestGrokLine(ev, filePath, s ? s.events.length : 0) || s;
             s.meta.sizeBytes = size;
             s.meta.source = "file";
             sessions.set(sid, s);
@@ -579,6 +779,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Realtime Agent Visualizer → http://${HOST}:${PORT}`);
   console.log(`Claude projects: ${PROJECTS_ROOT}`);
   console.log(`Codex sessions: ${CODEX_ROOT}`);
+  console.log(`Grok sessions: ${path.join(os.homedir(), ".grok", "sessions")}`);
   startWatcher();
 });
 

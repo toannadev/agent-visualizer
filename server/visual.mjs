@@ -38,7 +38,8 @@ export function buildGraph(events) {
       case "session_start":
         link(root, node, "parent"); cur = node; break;
       case "user_prompt":
-        link(cur, node, "turn"); cur = node; curTurn = ev.turnId || null; break;
+        // Each user turn is a sibling of the session, not a child of the previous turn.
+        link(root, node, "turn"); cur = node; curTurn = ev.turnId || null; break;
       case "reasoning":
         link(cur, node, "parent"); cur = node; break;
       case "agent_message":

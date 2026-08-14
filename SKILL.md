@@ -1,11 +1,11 @@
 ---
 name: agent-visualizer
-description: Open Agent Visualizer in realtime (execution graph, file heatmap, message log, and metrics) for Claude Code and Codex sessions. Use it to monitor or debug a running session.
+description: Open Agent Visualizer in realtime (execution graph, file heatmap, message log, and metrics) for Claude Code, Codex, and Grok sessions. Use it to monitor or debug a running session.
 ---
 
 # Agent Visualizer
 
-Agent Visualizer is an observability tool for Claude Code and Codex Agent Flows. It reads local JSONL sessions and displays an execution graph, file heatmap, message log, and metrics. It runs entirely locally (bound to `127.0.0.1`), does not call a model, and does not send data anywhere.
+Agent Visualizer is an observability tool for Claude Code, Codex, and Grok Agent Flows. It reads local JSONL sessions and displays an execution graph, file heatmap, message log, and metrics. It runs entirely locally (bound to `127.0.0.1`), does not call a model, and does not send data anywhere. The sidebar filter is All / Claude / Codex / Other.
 
 ## Getting Started
 
@@ -30,6 +30,7 @@ Then **restart Claude Code** so the hooks load at session start. Hooks send even
 ```bash
 npx agent-visualizer replay ~/.claude/projects/-Users-.../session.jsonl
 npx agent-visualizer replay ~/.codex/sessions/2026/.../rollout-....jsonl --runtime codex
+npx agent-visualizer replay ~/.grok/sessions/.../updates.jsonl --runtime grok
 ```
 
 Alternatively, open the **Replay** tab, paste the file path, and click ▶.

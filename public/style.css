@@ -139,6 +139,8 @@ a { color: var(--accent); text-decoration: none; }
 }
 .rt-badge.claude { background: #d2a8ff33; color: var(--purple); }
 .rt-badge.codex { background: #10a37f33; color: var(--codex); }
+.rt-badge.grok { background: #f9731633; color: #fb923c; }
+.rt-badge.other { background: #8b949e33; color: #c9d1d9; }
 
 .rt-live { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--green); margin-left: 8px; }
 .rt-live-dot { width: 8px; height: 8px; border-radius: 99px; background: var(--green); animation: pulse 1.4s infinite; }
