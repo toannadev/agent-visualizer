@@ -35,11 +35,40 @@
     return String(n);
   }
 
+  function parseTs(ts) {
+    if (ts == null || ts === "") return null;
+    if (typeof ts === "number" && Number.isFinite(ts)) {
+      return new Date(ts < 1e12 ? ts * 1000 : ts);
+    }
+    const s = String(ts).trim();
+    if (/^\d+(\.\d+)?$/.test(s)) {
+      const n = Number(s);
+      return new Date(n < 1e12 ? n * 1000 : n);
+    }
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
   function fmtTime(ts) {
-    if (!ts) return "–";
-    const d = new Date(ts);
-    if (isNaN(d)) return "–";
-    return d.toLocaleString("vi-VN", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const d = parseTs(ts);
+    if (!d) return "–";
+    return d.toLocaleString("vi-VN", {
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  }
+
+  function matchesRuntime(session, filter) {
+    const runtime = session?.meta?.runtime;
+    if (filter === "all") return true;
+    if (filter === "other") return runtime !== "claude" && runtime !== "codex";
+    return runtime === filter;
   }
 
   // ---------- state ----------
@@ -171,14 +200,15 @@
     const box = $("#sidebar");
     box.innerHTML = "";
     const filterRow = el("div", "rt-filter");
-    for (const f of ["all", "claude", "codex"]) {
-      const b = el("button", `rt-tab ${state.runtimeFilter === f ? "active" : ""}`, f === "all" ? "All" : f);
+    const labels = { all: "All", claude: "Claude", codex: "Codex", other: "Other" };
+    for (const f of ["all", "claude", "codex", "other"]) {
+      const b = el("button", `rt-tab ${state.runtimeFilter === f ? "active" : ""}`, labels[f]);
       b.onclick = () => { state.runtimeFilter = f; renderSidebar(); };
       filterRow.appendChild(b);
     }
     box.appendChild(filterRow);
 
-    const filtered = state.sessions.filter((s) => state.runtimeFilter === "all" || s?.meta?.runtime === state.runtimeFilter);
+    const filtered = state.sessions.filter((s) => matchesRuntime(s, state.runtimeFilter));
     if (!filtered.length) box.appendChild(el("div", "empty", "No sessions."));
     for (const s of filtered) {
       const m = s?.meta;
@@ -193,7 +223,7 @@
       badge.appendChild(dot);
       badge.appendChild(document.createTextNode(m.status));
       top.appendChild(badge);
-      top.appendChild(el("div", "s-title", m.cwd || m.projectDir || m.id));
+      top.appendChild(el("div", "s-title", m.title || m.cwd || m.projectDir || m.id));
       item.appendChild(top);
       const meta = el("div", "s-meta");
       meta.appendChild(el("span", "", `${s.metrics?.toolCount ?? 0} tool`));
@@ -220,7 +250,7 @@
     const hLeft = el("div");
     const h2 = el("h2");
     h2.appendChild(el("span", `rt-badge ${m.runtime}`, m.runtime));
-    h2.appendChild(document.createTextNode(` ${m.cwd || m.projectDir || m.id} `));
+    h2.appendChild(document.createTextNode(` ${m.title || m.cwd || m.projectDir || m.id} `));
     const badge = el("span", `badge ${m.status}`);
     const dot = el("span", "dot");
     dot.style.background = m.status === "running" ? "var(--green)" : "var(--muted)";
@@ -290,6 +320,16 @@
     return typeof value === "object" ? value?.id : value;
   }
 
+  function isGraphNoise(node) {
+    const label = String(node.label || "").trim();
+    if (node.kind === "agent_message") {
+      if (label === "▶ turn started" || label === "complete") return true;
+      if (label.startsWith("⏹ turn aborted")) return true;
+    }
+    if (node.kind === "user_prompt" && /^<(environment_context|turn_aborted)\b/i.test(label)) return true;
+    return false;
+  }
+
   // Keep the execution graph readable while retaining the full data elsewhere.
   function simplifyGraph(graph) {
     const sourceNodes = graph?.nodes || [];
@@ -297,6 +337,7 @@
       .filter((node) => GRAPH_VISIBLE_KINDS.has(node.kind))
       // The synthetic root already represents the session start.
       .filter((node) => node.kind !== "session_root" || node.id === "root")
+      .filter((node) => !isGraphNoise(node))
       .map((node) => ({ ...node }));
     const visibleIds = new Set(nodes.map((node) => node.id));
     const outgoing = new Map();
@@ -649,7 +690,7 @@
     panel.appendChild(el("h3", "", "Replay / track JSONL"));
     const row = el("div", "replay-row");
     const sel = el("select", "replay-select");
-    for (const [v, t] of [["claude", "Claude Code"], ["codex", "Codex"]]) {
+    for (const [v, t] of [["claude", "Claude Code"], ["codex", "Codex"], ["grok", "Grok / Other"]]) {
       const o = el("option", "", t);
       o.value = v;
       sel.appendChild(o);
@@ -672,6 +713,7 @@
     const hint = el("div", "replay-hint muted", "Examples:");
     hint.appendChild(el("code", "", "~/.claude/projects/-Users-…/session.jsonl (Claude)"));
     hint.appendChild(el("code", "", "~/.codex/sessions/2026/…/rollout-….jsonl (Codex)"));
+    hint.appendChild(el("code", "", "~/.grok/sessions/…/<id>/updates.jsonl (Grok)"));
     panel.appendChild(hint);
     box.appendChild(panel);
   }

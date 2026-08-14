@@ -186,6 +186,7 @@ Replay a Codex rollout:
 
 ```bash
 visualizer replay /Users/your-name/.codex/sessions/2026/08/12/rollout-....jsonl --runtime codex
+visualizer replay /Users/your-name/.grok/sessions/.../updates.jsonl --runtime grok
 ```
 
 You can also open the `Replay` tab in the dashboard, select a runtime, paste the file path, and run it.
@@ -197,7 +198,10 @@ Agent Visualizer reads only these local sources:
 ```text
 ~/.claude/projects/**/*.jsonl
 ~/.codex/sessions/**/rollout-*.jsonl
+~/.grok/sessions/**/updates.jsonl
 ```
+
+The sidebar filter is All / Claude / Codex / Other. Grok and any runtime that is not Claude or Codex appear under Other.
 
 Claude transcripts and Codex rollouts are converted into a common event format so the graph, heatmap, message log, and metrics can process them consistently.
 
@@ -220,6 +224,7 @@ All APIs bind only to `127.0.0.1`.
 - `server/realtime.mjs`: local server, watcher, hooks, SSE, and API.
 - `server/transcript.mjs`: reads and normalizes Claude Code transcripts.
 - `server/codex.mjs`: reads Codex rollouts.
+- `server/grok.mjs`: reads Grok sessions (`updates.jsonl`).
 - `server/visual.mjs`: builds the graph, heatmap, messages, and metrics.
 - `public/app.js`: dashboard logic, graph rendering, and user interactions.
 - `public/style.css`: dashboard styling.
@@ -236,6 +241,7 @@ All APIs bind only to `127.0.0.1`.
 | `visualizer patch-hooks` | Enable HTTP hooks for Claude Code |
 | `visualizer replay <path>` | Replay a Claude JSONL file |
 | `visualizer replay <path> --runtime codex` | Replay a Codex JSONL file |
+| `visualizer replay <path> --runtime grok` | Replay a Grok `updates.jsonl` file |
 
 ## Troubleshooting
 
@@ -252,6 +258,7 @@ Check that the server is running, the data directories exist, and wait a few sec
 ```text
 Claude Code: ~/.claude/projects/
 Codex:      ~/.codex/sessions/
+Grok:       ~/.grok/sessions/
 ```
 
 ### Hooks do not update in realtime

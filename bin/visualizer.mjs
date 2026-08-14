@@ -100,7 +100,7 @@ switch (cmd) {
     const p = args[0];
     const rtIdx = args.indexOf("--runtime");
     const runtime = rtIdx >= 0 ? args[rtIdx + 1] : undefined;
-    if (!p) { console.error("Usage: visualizer replay <path> [--runtime claude|codex]"); process.exit(1); }
+    if (!p) { console.error("Usage: visualizer replay <path> [--runtime claude|codex|grok]"); process.exit(1); }
     await cmdReplay(p, runtime);
     break;
   }
