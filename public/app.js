@@ -13,12 +13,6 @@
     return e;
   };
 
-  function esc(s) {
-    if (s == null) return "";
-    return String(s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  }
-
   function fmtMs(n) {
     if (n == null) return "–";
     const s = Math.round(n / 1000);
@@ -64,13 +58,6 @@
     });
   }
 
-  function matchesRuntime(session, filter) {
-    const runtime = session?.meta?.runtime;
-    if (filter === "all") return true;
-    if (filter === "other") return runtime !== "claude" && runtime !== "codex";
-    return runtime === filter;
-  }
-
   // ---------- state ----------
   const state = {
     sessions: [],
@@ -83,6 +70,7 @@
     lastUpdated: null,
     busy: false,
     inspected: null,
+    focusedPerson: null,
     es: null,
     pollTimer: null,
   };
@@ -145,7 +133,7 @@
         state.live = true;
         const d = JSON.parse(e.data);
         const idx = state.sessions.findIndex((s) => s?.meta?.id === d.id);
-        const summary = { meta: d.meta, metrics: d.metrics };
+        const summary = { meta: d.meta, metrics: d.metrics, officeCounts: d.officeCounts || null };
         if (idx >= 0) state.sessions[idx] = summary;
         else state.sessions.unshift(summary);
         if (state.selectedId === d.id) loadDetail(d.id);
@@ -196,42 +184,132 @@
   }
 
   // ---------- sidebar ----------
+  function matchesRuntime(s) {
+    return state.runtimeFilter === "all" || s?.meta?.runtime === state.runtimeFilter;
+  }
+
   function renderSidebar() {
     const box = $("#sidebar");
     box.innerHTML = "";
     const filterRow = el("div", "rt-filter");
-    const labels = { all: "All", claude: "Claude", codex: "Codex", other: "Other" };
-    for (const f of ["all", "claude", "codex", "other"]) {
-      const b = el("button", `rt-tab ${state.runtimeFilter === f ? "active" : ""}`, labels[f]);
+    for (const f of ["all", "claude", "codex", "grok"]) {
+      const label = f === "all" ? "All" : f;
+      const b = el("button", `rt-tab ${state.runtimeFilter === f ? "active" : ""}`, label);
       b.onclick = () => { state.runtimeFilter = f; renderSidebar(); };
       filterRow.appendChild(b);
     }
     box.appendChild(filterRow);
 
-    const filtered = state.sessions.filter((s) => matchesRuntime(s, state.runtimeFilter));
-    if (!filtered.length) box.appendChild(el("div", "empty", "No sessions."));
-    for (const s of filtered) {
-      const m = s?.meta;
-      if (!m) continue;
-      const item = el("div", `session-item ${m.id === state.selectedId ? "active" : ""}`);
-      item.onclick = () => { state.selectedId = m.id; loadDetail(m.id); };
-      const top = el("div", "s-top");
-      top.appendChild(el("span", `rt-badge ${m.runtime}`, m.runtime));
-      const badge = el("span", `badge ${m.status}`);
-      const dot = el("span", "dot");
-      dot.style.background = m.status === "running" ? "var(--green)" : "var(--muted)";
-      badge.appendChild(dot);
-      badge.appendChild(document.createTextNode(m.status));
-      top.appendChild(badge);
-      top.appendChild(el("div", "s-title", m.title || m.cwd || m.projectDir || m.id));
-      item.appendChild(top);
-      const meta = el("div", "s-meta");
-      meta.appendChild(el("span", "", `${s.metrics?.toolCount ?? 0} tool`));
-      meta.appendChild(el("span", "", fmtTime(m.mtimeMs)));
-      if (m.model) meta.appendChild(el("span", "", m.model));
-      item.appendChild(meta);
-      box.appendChild(item);
+    const { groups, loose } = groupSessions(state.sessions);
+    const shownGroups = groups.filter((g) => g.members.some(matchesRuntime));
+    const shownLoose = loose.filter(matchesRuntime);
+    if (!shownGroups.length && !shownLoose.length) {
+      box.appendChild(el("div", "empty", "No sessions."));
     }
+    for (const g of shownGroups) box.appendChild(renderTeamItem(g));
+    for (const s of shownLoose) box.appendChild(renderSessionItem(s));
+  }
+
+  function groupSessions(list) {
+    const byTeam = new Map();
+    const loose = [];
+    for (const s of list) {
+      const tid = s?.meta?.team?.id;
+      if (!tid) { loose.push(s); continue; }
+      if (!byTeam.has(tid)) byTeam.set(tid, []);
+      byTeam.get(tid).push(s);
+    }
+    const groups = [];
+    for (const [, members] of byTeam) {
+      if (members.length >= 2) {
+        members.sort((a, b) => (b.meta?.mtimeMs || 0) - (a.meta?.mtimeMs || 0));
+        groups.push({
+          id: members[0].meta.team.id,
+          label: members[0].meta.team.label || "team",
+          members,
+        });
+      } else {
+        loose.push(members[0]);
+      }
+    }
+    groups.sort((a, b) => maxMtime(b.members) - maxMtime(a.members));
+    loose.sort((a, b) => (b.meta?.mtimeMs || 0) - (a.meta?.mtimeMs || 0));
+    return { groups, loose };
+  }
+
+  function maxMtime(members) {
+    return Math.max(0, ...members.map((s) => s.meta?.mtimeMs || 0));
+  }
+
+  function selectSession(id) {
+    if (state.selectedId !== id) {
+      state.focusedPerson = null;
+      state.inspected = null;
+    }
+    state.selectedId = id;
+    loadDetail(id);
+  }
+
+  function teamLeadSession(members) {
+    return members.find((s) => s.meta?.roleOverride === "lead")
+      || members.find((s) => s.meta?.team?.hodRole === "controller" || s.meta?.team?.hodRole === "lead")
+      || members[0];
+  }
+
+  function renderTeamItem(g) {
+    const members = g.members;
+    const lead = teamLeadSession(members);
+    const selected = members.some((s) => s.meta?.id === state.selectedId);
+    const item = el("div", `session-item session-team${selected ? " active" : ""}`);
+    item.onclick = () => selectSession(lead?.meta?.id);
+    const top = el("div", "s-top");
+    top.appendChild(el("span", "rt-badge herdr", "herdr"));
+    const runtimes = [...new Set(members.map((s) => s.meta?.runtime).filter(Boolean))];
+    for (const rt of runtimes) top.appendChild(el("span", `rt-badge ${rt}`, rt));
+    const statuses = members.map((s) => s.meta?.status);
+    const status = statuses.includes("running") ? "running" : statuses.includes("error") ? "error" : (lead?.meta?.status || "idle");
+    const badge = el("span", `badge ${status}`);
+    const dot = el("span", "dot");
+    dot.style.background = status === "running" ? "var(--green)" : "var(--muted)";
+    badge.appendChild(dot);
+    badge.appendChild(document.createTextNode(status));
+    top.appendChild(badge);
+    top.appendChild(el("div", "s-title", g.label || "team"));
+    item.appendChild(top);
+    const meta = el("div", "s-meta");
+    meta.appendChild(el("span", "", `${members.length} agents`));
+    const names = [...new Set(members.map((s) => s.meta?.team?.herdrName).filter(Boolean))];
+    if (names.length) meta.appendChild(el("span", "", names.join(", ")));
+    const tools = members.reduce((n, s) => n + (s.metrics?.toolCount || 0), 0);
+    meta.appendChild(el("span", "", `${tools} tool`));
+    meta.appendChild(el("span", "", fmtTime(maxMtime(members))));
+    item.appendChild(meta);
+    return item;
+  }
+
+  function renderSessionItem(s) {
+    const m = s?.meta;
+    if (!m) return el("div");
+    const item = el("div", `session-item${m.id === state.selectedId ? " active" : ""}`);
+    item.onclick = () => selectSession(m.id);
+    const top = el("div", "s-top");
+    if (m.team) top.appendChild(el("span", "rt-badge herdr", "herdr"));
+    if (m.runtime) top.appendChild(el("span", `rt-badge ${m.runtime}`, m.runtime));
+    const badge = el("span", `badge ${m.status}`);
+    const dot = el("span", "dot");
+    dot.style.background = m.status === "running" ? "var(--green)" : "var(--muted)";
+    badge.appendChild(dot);
+    badge.appendChild(document.createTextNode(m.status));
+    top.appendChild(badge);
+    top.appendChild(el("div", "s-title", m.title || m.cwd || m.projectDir || m.id));
+    item.appendChild(top);
+    const meta = el("div", "s-meta");
+    meta.appendChild(el("span", "", `${s.metrics?.toolCount ?? 0} tool`));
+    if (s.officeCounts?.doing) meta.appendChild(el("span", "", `${s.officeCounts.doing} doing`));
+    meta.appendChild(el("span", "", fmtTime(m.mtimeMs)));
+    if (m.model) meta.appendChild(el("span", "", m.model));
+    item.appendChild(meta);
+    return item;
   }
 
   // ---------- detail ----------
@@ -245,12 +323,12 @@
     }
     const s = state.detail;
     const m = s.meta, met = s.metrics;
+    refreshInspected(s.office);
 
     const head = el("div", "detail-head");
     const hLeft = el("div");
     const h2 = el("h2");
-    h2.appendChild(el("span", `rt-badge ${m.runtime}`, m.runtime));
-    h2.appendChild(document.createTextNode(` ${m.title || m.cwd || m.projectDir || m.id} `));
+    h2.appendChild(document.createTextNode(`${m.title || m.cwd || m.projectDir || m.id} `));
     const badge = el("span", `badge ${m.status}`);
     const dot = el("span", "dot");
     dot.style.background = m.status === "running" ? "var(--green)" : "var(--muted)";
@@ -284,26 +362,332 @@
     const mkPanel = (title, className = "") => {
       const p = el("div", `v-panel-wrap${className ? ` ${className}` : ""}`);
       p.appendChild(el("div", "v-panel-title", title));
-      const body = el("div");
+      const body = el("div", className ? `${className}-body` : "");
       p.appendChild(body);
       grid.appendChild(p);
       return body;
     };
 
-    const graphBox = mkPanel("Execution Graph", "graph-panel");
-    const heatBox = mkPanel("Files");
+    const officeBox = mkPanel(officePanelTitle(s.office), "office-panel");
+    const graphBox = mkPanel(
+      state.focusedPerson
+        ? `Forensics · Execution Graph · ${personLabel(officePerson(s.office, state.focusedPerson))}`
+        : "Forensics · Execution Graph",
+      "graph-panel",
+    );
+    const heatTitle = state.focusedPerson
+      ? `Files · ${personLabel(officePerson(s.office, state.focusedPerson))}`
+      : "Files";
+    const heatBox = mkPanel(heatTitle);
     const msgBox = mkPanel(`Messages (${s.messages.length})`);
     wrap.appendChild(grid);
 
+    renderOffice(officeBox, s.office);
+    const files = focusedFiles(s.office, s.heatmap);
+    renderHeatmap(heatBox, files, { filtered: Boolean(state.focusedPerson) });
+    renderMessageLog(msgBox, s.messages);
     try {
-      renderGraph(graphBox, s.graph);
+      renderGraph(graphBox, s.graph, { compact: true });
     } catch (err) {
       console.error("Graph render failed", err);
       renderStaticGraph(graphBox, s.graph);
     }
-    renderHeatmap(heatBox, s.heatmap);
-    renderMessageLog(msgBox, s.messages);
   }
+
+  function officePanelTitle(office) {
+    if (!office) return "Office";
+    const c = office.counts || {};
+    const bits = [];
+    if (office.teamLabel) bits.push(office.teamLabel);
+    bits.push(`${c.people || 1} people`);
+    if (c.doing) bits.push(`${c.doing} doing`);
+    if (c.blocked) bits.push(`${c.blocked} blocked`);
+    return `Office · ${bits.join(" · ")}`;
+  }
+
+  function officePerson(office, id) {
+    return (office?.people || []).find((p) => p.id === id) || null;
+  }
+
+  function personRuntime(p) {
+    if (p?.runtime) return p.runtime;
+    if (p?.kind === "lead") return state.detail?.meta?.runtime || "";
+    return "";
+  }
+
+  function prettyRuntime(runtime) {
+    const rt = String(runtime || "").toLowerCase();
+    if (rt === "claude") return "Claude";
+    if (rt === "codex") return "Codex";
+    if (rt === "grok") return "Grok";
+    if (!rt || rt === "other") return "";
+    return rt.charAt(0).toUpperCase() + rt.slice(1);
+  }
+
+  function isRuntimeEcho(text, runtime) {
+    const a = String(text || "").trim().toLowerCase();
+    if (!a) return false;
+    const rt = String(runtime || "").trim().toLowerCase();
+    const pretty = prettyRuntime(runtime).toLowerCase();
+    return a === rt || (pretty && a === pretty);
+  }
+
+  function spawnName(p) {
+    const name = String(p?.herdrName || "").trim();
+    if (!name || isRuntimeEcho(name, personRuntime(p))) return "";
+    return name;
+  }
+
+  function personLabel(p) {
+    return spawnName(p) || roleBadgeText(p) || p?.label || p?.id || "desk";
+  }
+
+  function displayWork(text) {
+    return String(text || "")
+      .replace(/\*\*(.*?)\*\*/g, "$1")
+      .replace(/^#+\s+/gm, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function focusedFiles(office, heatmap) {
+    if (!state.focusedPerson || !office?.artifacts) return heatmap || [];
+    const person = officePerson(office, state.focusedPerson);
+    const allowed = new Set((person?.files || []).map((f) => f.path));
+    return (heatmap || []).filter((f) => allowed.has(f.path));
+  }
+
+  function refreshInspected(office) {
+    const node = state.inspected;
+    if (!node || !office) return;
+    if (node.inspect === "person") {
+      const fresh = officePerson(office, node.id);
+      state.inspected = fresh ? { inspect: "person", ...fresh } : null;
+    } else if (node.inspect === "artifact") {
+      const fresh = (office.artifacts || []).find((a) => a.path === node.path);
+      state.inspected = fresh ? { inspect: "artifact", ...fresh } : node;
+    }
+  }
+
+  function clearOfficeFocus() {
+    state.focusedPerson = null;
+    if (state.inspected?.inspect === "person" || state.inspected?.inspect === "artifact") {
+      state.inspected = null;
+    }
+    renderAll();
+  }
+
+  function focusPerson(person) {
+    state.focusedPerson = person.id;
+    state.inspected = { inspect: "person", ...person };
+    renderAll();
+  }
+
+  function inspectArtifact(art) {
+    state.inspected = { inspect: "artifact", status: "idle", kind: "artifact", ...art };
+    renderInspector();
+  }
+
+  // ---------- office floor ----------
+  function renderOffice(box, office) {
+    box.innerHTML = "";
+    if (!office) {
+      box.appendChild(el("div", "empty", "Waiting for the first prompt…"));
+      return;
+    }
+    const people = office.people || [];
+    const lead = people.find((p) => p.kind === "lead") || people[0];
+    const subs = people.filter((p) => p.kind === "subagent");
+
+    const root = el("div", "office");
+    root.addEventListener("click", (evt) => {
+      if (evt.target === root || evt.target.classList.contains("office-floor")) clearOfficeFocus();
+    });
+
+    if (state.focusedPerson) {
+      const bar = el("div", "office-focus-bar");
+      bar.appendChild(el("span", "", `Focused: ${personLabel(officePerson(office, state.focusedPerson))}`));
+      const clear = el("button", "btn", "Show all");
+      clear.addEventListener("click", (evt) => { evt.stopPropagation(); clearOfficeFocus(); });
+      bar.appendChild(clear);
+      root.appendChild(bar);
+    }
+
+    if (!people.length || (people.length === 1 && !lead?.ticketId && !lead?.toolCount && !office.brief)) {
+      root.appendChild(el("div", "empty", "Waiting for the first prompt…"));
+    }
+
+    const floor = el("div", "office-floor");
+
+    const userNode = el("div", "office-node");
+    userNode.appendChild(renderUserCard(office.brief));
+
+    if (lead) {
+      const leadNode = el("div", "office-node");
+      leadNode.appendChild(renderDesk(lead));
+      if (subs.length) {
+        leadNode.appendChild(renderKids("assign", staffConnectFlow(subs), subs));
+      }
+      userNode.appendChild(renderKids("assign", deskBusy(lead) ? "down" : "up", [leadNode]));
+    }
+
+    floor.appendChild(userNode);
+    root.appendChild(floor);
+    box.appendChild(root);
+    requestAnimationFrame(() => layoutOfficeRails(root));
+  }
+
+  const SPARK_MS = 1600;
+
+  function deskBusy(person) {
+    return person?.status === "doing" || person?.status === "blocked";
+  }
+
+  function staffConnectFlow(people) {
+    const busy = people.some(deskBusy);
+    const returned = people.some((p) => p.status === "done");
+    if (busy && returned) return "both";
+    if (busy) return "down";
+    if (returned) return "up";
+    return "down";
+  }
+
+  function sparkPhase(salt) {
+    let n = 0;
+    for (const ch of String(salt || "")) n += ch.charCodeAt(0);
+    return (Date.now() + n * 420) % SPARK_MS;
+  }
+
+  function addSparks(node, flow, salt, kind) {
+    const extra = kind ? ` office-spark-${kind}` : "";
+    const shift = kind === "rail" ? SPARK_MS / 3 : kind === "drop" ? (2 * SPARK_MS) / 3 : 0;
+    const phase = (sparkPhase(salt) + shift) % SPARK_MS;
+    if (flow === "down" || flow === "both") {
+      const spark = el("span", `office-spark office-spark-down${extra}`);
+      spark.style.animationDelay = `${-phase}ms`;
+      node.appendChild(spark);
+    }
+    if (flow === "up" || flow === "both") {
+      const spark = el("span", `office-spark office-spark-up${extra}`);
+      spark.style.animationDelay = `${-((phase + SPARK_MS / 2) % SPARK_MS)}ms`;
+      node.appendChild(spark);
+    }
+  }
+
+  function layoutOfficeRails(root) {
+    for (const box of root.querySelectorAll(".office-kids.is-fork")) {
+      const nodes = [...box.querySelectorAll(":scope > .office-node")];
+      const jr = box.getBoundingClientRect();
+      const junctionX = jr.left + jr.width / 2;
+      for (const node of nodes) {
+        const r = node.getBoundingClientRect();
+        const dx = r.left + r.width / 2 - junctionX;
+        node.style.setProperty("--rail-dx", `${dx}px`);
+        const hide = Math.abs(dx) < 8;
+        for (const spark of node.querySelectorAll(":scope > .office-spark-rail")) {
+          spark.style.display = hide ? "none" : "";
+        }
+      }
+    }
+  }
+
+  function renderKids(label, flow, items) {
+    const fork = items.length > 1;
+    const box = el("div", `office-kids${flow ? ` is-flow-${flow}` : ""}${fork ? " is-fork" : ""}`);
+    if (label) box.appendChild(el("span", "office-connect-tag", label));
+    addSparks(box, flow, label, "stem");
+    items.forEach((item, i) => {
+      let node = item;
+      if (!(item instanceof HTMLElement)) {
+        node = el("div", "office-node");
+        node.appendChild(renderDesk(item));
+      }
+      if (fork) {
+        addSparks(node, flow, `${label}-rail-${i}`, "rail");
+        addSparks(node, flow, `${label}-${i}`, "drop");
+      }
+      box.appendChild(node);
+    });
+    return box;
+  }
+
+  function renderUserCard(brief) {
+    const card = el("div", "office-desk office-desk-user");
+    const top = el("div", "office-desk-top");
+    top.appendChild(el("span", "office-desk-name", "User"));
+    card.appendChild(top);
+    card.appendChild(el("div", "office-desk-work", displayWork(brief) || "asked"));
+    return card;
+  }
+
+  function renderDesk(person) {
+    const selected = state.focusedPerson === person.id ? " is-selected" : "";
+    const card = el("button", `office-desk office-desk-${person.kind}${selected}`);
+    card.type = "button";
+    card.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      if (state.focusedPerson === person.id && state.inspected?.inspect === "person") {
+        clearOfficeFocus();
+      } else {
+        focusPerson(person);
+      }
+    });
+
+    const top = el("div", "office-desk-top");
+    const lamp = el("span", `office-lamp ${person.status}`);
+    top.appendChild(lamp);
+    const runtime = personRuntime(person);
+    if (runtime) top.appendChild(el("span", `rt-badge ${runtime}`, runtime));
+    const spawn = spawnName(person);
+    if (spawn) top.appendChild(el("span", "office-desk-name", spawn));
+    const role = effectiveRole(person);
+    const roleBadge = roleBadgeText(person);
+    if (roleBadge) top.appendChild(el("span", `office-role role-${role}`, roleBadge));
+    card.appendChild(top);
+
+    const assigns = person.kind === "lead" ? (person.assignments || []) : [];
+    if (assigns.length) {
+      const list = el("div", "office-assigns");
+      for (const a of assigns) {
+        const row = el("div", `office-assign ${a.status || ""}`);
+        row.appendChild(el("span", "office-assign-who", a.who || "agent"));
+        row.appendChild(el("span", "office-assign-task", displayWork(a.task) || ""));
+        list.appendChild(row);
+      }
+      card.appendChild(list);
+    } else {
+      card.appendChild(el("div", "office-desk-work", displayWork(person.currentWork) || "Idle"));
+    }
+
+    if (person.errorCount) {
+      card.appendChild(el("div", "office-desk-meta office-err", `${person.errorCount} err`));
+    }
+    card.classList.add(`office-desk-role-${role}`);
+    return card;
+  }
+
+  function effectiveRole(person) {
+    const role = person?.roleHint;
+    if (person?.kind === "lead" || role === "lead") return "lead";
+    if (!role || role === "unknown") return "worker";
+    return role;
+  }
+
+  function roleBadgeText(person) {
+    const labels = {
+      lead: "Lead",
+      worker: "Worker",
+      explore: "Explore",
+      implement: "Coder",
+      review: "Review",
+      advisor: "Advisor",
+      tester: "Tester",
+    };
+    const role = effectiveRole(person);
+    return labels[role] || role;
+  }
+
+
 
   // ---------- graph (d3-force layout) ----------
   const KIND_COLOR = {
@@ -396,16 +780,17 @@
     box.appendChild(legend);
   }
 
-  function renderGraph(box, graph) {
+  function renderGraph(box, graph, opts = {}) {
     box.innerHTML = "";
     const displayGraph = simplifyGraph(graph);
     addGraphLegend(box);
-    const wrap = el("div", "graph-wrap");
+    const wrap = el("div", `graph-wrap${opts.compact ? " graph-wrap-forensics" : ""}`);
     box.appendChild(wrap);
     if (!displayGraph.nodes.length) { wrap.appendChild(el("div", "empty", "No data.")); return; }
 
     const width = Math.max(360, wrap.clientWidth || 640);
-    const height = 540;
+    const height = opts.compact ? 420 : 540;
+    const focusIds = focusedEventIds();
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     wrap.appendChild(svg);
@@ -451,6 +836,7 @@
     nodes.forEach((n) => {
       const gn = document.createElementNS("http://www.w3.org/2000/svg", "g");
       gn.classList.add("g-node");
+      if (focusIds && !nodeBelongsToFocus(n, focusIds)) gn.classList.add("is-dim");
       const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
       c.setAttribute("r", n.kind === "session_root" ? "10" : n.kind === "user_prompt" ? "8" : "7");
       c.setAttribute("fill", KIND_COLOR[n.kind] || "#8b949e");
@@ -516,6 +902,21 @@
     });
     if (graphSim) graphSim.stop();
     graphSim = sim;
+  }
+
+  function focusedEventIds() {
+    if (!state.focusedPerson) return null;
+    const person = officePerson(state.detail?.office, state.focusedPerson);
+    return person?.eventIds?.length ? new Set(person.eventIds) : new Set();
+  }
+
+  function nodeBelongsToFocus(node, focusIds) {
+    if (!focusIds) return true;
+    if (node.kind === "session_root") return true;
+    if (focusIds.has(node.id)) return true;
+    if (state.focusedPerson === "lead" && node.kind === "user_prompt") return true;
+    if (node.agentId && node.agentId === state.focusedPerson) return true;
+    return false;
   }
   function renderStaticGraph(box, graph) {
     box.innerHTML = "";
@@ -610,8 +1011,11 @@
   }
 
   // ---------- heatmap ----------
-  function renderHeatmap(box, files) {
-    if (!files?.length) { box.innerHTML = `<div class="empty">No files accessed.</div>`; return; }
+  function renderHeatmap(box, files, opts = {}) {
+    if (!files?.length) {
+      box.innerHTML = `<div class="empty">${opts.filtered ? "No files attributed to this desk." : "No files accessed."}</div>`;
+      return;
+    }
     const max = Math.max(1, ...files.map((f) => f.total));
     const heat = el("div", "heat");
     for (const f of files.slice(0, 60)) {
@@ -662,21 +1066,124 @@
     overlay.onclick = () => { state.inspected = null; renderInspector(); };
     const panel = el("div", "inspector-panel");
     panel.onclick = (e) => e.stopPropagation();
+    if (node.inspect === "person") renderPersonInspector(panel, node);
+    else if (node.inspect === "artifact") renderArtifactInspector(panel, node);
+    else renderNodeInspector(panel, node);
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+  }
+
+  function inspectorChrome(panel, badge, kind, title) {
     const head = el("div", "inspector-head");
-    head.appendChild(el("span", `badge ${node.status}`, node.status));
-    head.appendChild(el("span", "inspector-kind", node.kind));
+    if (badge) head.appendChild(el("span", `badge ${badge}`, badge));
+    head.appendChild(el("span", "inspector-kind", kind));
     const close = el("button", "btn inspector-close", "✕");
     close.onclick = () => { state.inspected = null; renderInspector(); };
     head.appendChild(close);
     panel.appendChild(head);
-    panel.appendChild(el("div", "inspector-label", node.label));
-    if (node.toolName) panel.appendChild(el("div", "inspector-row", `tool: <code>${esc(node.toolName)}</code>`));
-    if (node.turnId) panel.appendChild(el("div", "inspector-row", `turn: <code>${esc(node.turnId)}</code>`));
-    if (node.agentId) panel.appendChild(el("div", "inspector-row", `agent: <code>${esc(node.agentId)}</code>`));
-    if (node.durationMs != null) panel.appendChild(el("div", "inspector-row", `duration: <b>${Math.round(node.durationMs / 1000)}s</b>`));
+    if (title) panel.appendChild(el("div", "inspector-label", title));
+  }
+
+  const ROLE_OPTIONS = [
+    ["lead", "Lead"],
+    ["worker", "Worker"],
+    ["explore", "Explore"],
+    ["implement", "Coder"],
+    ["review", "Review"],
+    ["advisor", "Advisor"],
+    ["tester", "Tester"],
+  ];
+
+  function renderRolePicker(person) {
+    const row = el("div", "inspector-row inspector-role-pick");
+    row.appendChild(el("span", "", "role: "));
+    const sel = el("select", "replay-select inspector-role");
+    for (const [value, label] of ROLE_OPTIONS) {
+      const o = el("option", "", label);
+      o.value = value;
+      if (effectiveRole(person) === value) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.onchange = async () => {
+      const sid = person.sessionId || state.selectedId;
+      if (!sid) return;
+      try {
+        await api(`/api/v1/sessions/${encodeURIComponent(sid)}/role`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ role: sel.value }),
+        });
+        await loadDetail(state.selectedId);
+      } catch (err) {
+        sel.blur();
+        console.error(err);
+      }
+    };
+    row.appendChild(sel);
+    const src = person.roleSource === "hod" ? "herdr" : person.roleSource || "inferred";
+    row.appendChild(el("span", "muted", ` · ${src}`));
+    return row;
+  }
+
+  function inspectorRow(label, value) {
+    const row = el("div", "inspector-row");
+    row.appendChild(el("span", "", `${label}: `));
+    row.appendChild(el("code", "", value));
+    return row;
+  }
+
+  function renderNodeInspector(panel, node) {
+    inspectorChrome(panel, node.status, node.kind, node.label);
+    if (node.toolName) panel.appendChild(inspectorRow("tool", node.toolName));
+    if (node.turnId) panel.appendChild(inspectorRow("turn", node.turnId));
+    if (node.agentId) panel.appendChild(inspectorRow("agent", node.agentId));
+    if (node.durationMs != null) panel.appendChild(inspectorRow("duration", `${Math.round(node.durationMs / 1000)}s`));
     if (node.detail) panel.appendChild(el("pre", "inspector-detail", node.detail));
-    overlay.appendChild(panel);
-    document.body.appendChild(overlay);
+  }
+
+  function renderPersonInspector(panel, person) {
+    inspectorChrome(panel, person.status, person.kind === "lead" ? "lead" : "subagent", personLabel(person));
+    panel.appendChild(inspectorRow("id", person.id));
+    if (personRuntime(person)) panel.appendChild(inspectorRow("runtime", prettyRuntime(personRuntime(person)) || personRuntime(person)));
+    const spawn = spawnName(person);
+    if (spawn && spawn !== personLabel(person)) panel.appendChild(inspectorRow("spawn", spawn));
+    panel.appendChild(renderRolePicker(person));
+    if (person.currentWork) panel.appendChild(inspectorRow("work", displayWork(person.currentWork)));
+    panel.appendChild(el("div", "inspector-note", "Attribution is best-effort from the session log."));
+
+    if (person.toolBelt?.length) {
+      panel.appendChild(el("div", "inspector-sub", "Tool belt"));
+      const belt = el("div", "office-tools");
+      for (const t of person.toolBelt) {
+        belt.appendChild(el("span", "office-tool", `${t.name} ${t.count}`));
+      }
+      panel.appendChild(belt);
+    }
+
+    if (person.files?.length) {
+      panel.appendChild(el("div", "inspector-sub", "Files"));
+      for (const f of person.files.slice(0, 12)) {
+        panel.appendChild(inspectorRow(f.path, `${f.read || 0}r ${f.write || 0}w ${f.edit || 0}e`));
+      }
+    }
+
+    const hops = (state.detail?.office?.handoffs || [])
+      .filter((h) => h.fromId === person.id || h.toId === person.id)
+      .slice(-3);
+    if (hops.length) {
+      panel.appendChild(el("div", "inspector-sub", "Recent handoffs"));
+      for (const h of hops) {
+        panel.appendChild(el("div", "inspector-row", `${h.kind}: ${h.fromId} → ${h.toId}${h.summary ? " · " + h.summary : ""}`));
+      }
+    }
+  }
+
+  function renderArtifactInspector(panel, art) {
+    inspectorChrome(panel, "idle", "artifact", art.path);
+    panel.appendChild(inspectorRow("ops", `${art.read || 0}r ${art.write || 0}w ${art.edit || 0}e`));
+    const names = (art.touchedBy || []).map((id) => personLabel(officePerson(state.detail?.office, id)) || id);
+    panel.appendChild(inspectorRow("touched by", names.join(", ") || "unknown"));
+    panel.appendChild(el("div", "inspector-note", "Who touched this file is attributed from the session log."));
   }
 
   // ---------- replay ----------
@@ -737,6 +1244,10 @@
     if (state.selectedId) loadDetail(state.selectedId);
     setupSSE();
     setupPoll();
+    window.addEventListener("resize", () => {
+      const office = document.querySelector(".office");
+      if (office) layoutOfficeRails(office);
+    });
   }
 
   document.addEventListener("DOMContentLoaded", init);

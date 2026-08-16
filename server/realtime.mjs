@@ -8,6 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { recompute } from "./visual.mjs";
+import { emptyOffice, mergeTeamView, applyAssignedRole } from "./office.mjs";
+import { ASSIGNABLE_ROLES, canonicalizeRole } from "./roles.mjs";
+import { readHerdrSnapshot, attachHerdrTeams } from "./herdr.mjs";
 import { findRolloutPaths, readCodexRollout, readCodexRolloutFull, sessionIdFromPath } from "./codex.mjs";
 import { readTranscript, redactString } from "./transcript.mjs";
 import {
@@ -78,6 +81,7 @@ function seedSession(runtime, id, { cwd = "", filePath = "", title = "", model =
     },
     events: [], graph: { nodes: [], links: [] }, timeline: [], heatmap: [], messages: [],
     metrics: { toolCount: 0, tokenTotal: 0, durationMs: 0, errorCount: 0, fileCount: 0 },
+    office: emptyOffice(),
   };
 }
 
@@ -88,7 +92,14 @@ function recomputeSession(s) {
   s.heatmap = d.heatmap;
   s.messages = d.messages;
   s.metrics = d.metrics;
+  s.office = d.office;
   return s;
+}
+
+function teammates(s) {
+  const tid = s?.meta?.team?.id;
+  if (!tid) return [s];
+  return [...sessions.values()].filter((x) => x?.meta?.team?.id === tid);
 }
 
 function pushEvent(s, ev) {
@@ -111,7 +122,7 @@ function safeStatSize(p) {
 function emitUpsert(id) {
   const s = sessions.get(id);
   if (!s) return;
-  broadcast("session.upsert", { id, meta: s.meta, metrics: s.metrics, events: s.events.slice(-20) });
+  broadcast("session.upsert", { id, meta: s.meta, metrics: s.metrics, officeCounts: s.office?.counts || null, events: s.events.slice(-20) });
 }
 
 // ---------- Claude hook ingestion ----------
@@ -519,6 +530,13 @@ function tailTick() {
 
   // 3) Grok sessions (updates.jsonl)
   for (const fp of findGrokUpdatePaths()) tailFile(fp, "grok");
+
+  // 4) Join sessions that share a live Herdr tab (Claude giao / Grok nhận).
+  const snap = readHerdrSnapshot();
+  if (snap.ok) {
+    const herdrChanged = attachHerdrTeams([...sessions.values()], snap.agents, { live: true });
+    for (const id of herdrChanged) emitUpsert(id);
+  }
 }
 
 function tailFile(filePath, runtime) {
@@ -663,9 +681,31 @@ const server = http.createServer(async (req, res) => {
 
     if (p === "/api/v1/sessions" && req.method === "GET") {
       const out = [...sessions.values()]
-        .map((s) => ({ meta: s.meta, metrics: s.metrics }))
+        .map((s) => ({ meta: s.meta, metrics: s.metrics, officeCounts: s.office?.counts || null }))
         .sort((a, b) => (b.meta?.mtimeMs || 0) - (a.meta?.mtimeMs || 0));
       return sendJson(res, 200, { sessions: out });
+    }
+
+    if (p.startsWith("/api/v1/sessions/") && p.endsWith("/role") && req.method === "POST") {
+      const id = decodeURIComponent(p.slice("/api/v1/sessions/".length, p.length - "/role".length));
+      const s = sessions.get(id);
+      if (!s) return sendJson(res, 404, { error: "not found" });
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        try {
+          const role = canonicalizeRole(JSON.parse(body || "{}").role);
+          if (!role || !ASSIGNABLE_ROLES.includes(role)) {
+            return sendJson(res, 400, { error: "invalid role", roles: ASSIGNABLE_ROLES });
+          }
+          s.meta.roleOverride = role;
+          emitUpsert(id);
+          return sendJson(res, 200, { ok: true, id, role });
+        } catch (err) {
+          return sendJson(res, 400, { error: String(err) });
+        }
+      });
+      return;
     }
 
     if (p.startsWith("/api/v1/sessions/")) {
@@ -674,6 +714,14 @@ const server = http.createServer(async (req, res) => {
       if (!s) return sendJson(res, 404, { error: "not found" });
       // Cap events sent to avoid oversized payloads.
       const sCopy = { ...s, events: s.events.slice(-2000) };
+      const team = teammates(s);
+      if (team.length >= 2) {
+        const view = mergeTeamView(team);
+        sCopy.office = view.office;
+        sCopy.heatmap = view.heatmap;
+      } else if (s.meta.roleOverride) {
+        sCopy.office = applyAssignedRole(s.office, s.meta.roleOverride);
+      }
       return sendJson(res, 200, { session: sCopy });
     }
 

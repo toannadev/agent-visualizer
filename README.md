@@ -14,7 +14,10 @@ This is not an AI Agent engine and does not orchestrate work. Claude Code or Cod
 ## Features
 
 - Monitor multiple Claude Code and Codex sessions.
+- Group Claude and Grok sessions that share a live Herdr tab (same workspace pane split).
+- Read Herdr `hod_role` (controller / worker / advisor / reviewer / tester) from `herdr api snapshot` so assigned roles show on the office floor.
 - Receive realtime updates through file watching, Claude HTTP hooks, and SSE.
+- Use the Office floor to see who is working, what they are processing, and how work is handed off.
 - Use the Execution Graph to visualize prompts, agents, tools, subagents, and errors.
 - Hide technical nodes to keep the graph readable.
 - Drag nodes, pan the canvas, and zoom the graph with the mouse wheel.
@@ -30,6 +33,7 @@ This is not an AI Agent engine and does not orchestrate work. Claude Code or Cod
 
 Agent Visualizer is useful for:
 
+- Seeing which agent is working, what they are processing, and who handed work to whom.
 - Debugging when an AI agent edits code incorrectly or calls the wrong tool.
 - Checking which files an agent read or changed.
 - Analyzing a complex Agent Flow step by step.
@@ -116,7 +120,7 @@ Restart Claude Code, then use:
 
 ```bash
 git clone <repository-url>
-cd claude-session-viewer
+cd agent-session-viewer
 npm install
 npm run build
 npm start
@@ -201,9 +205,7 @@ Agent Visualizer reads only these local sources:
 ~/.grok/sessions/**/updates.jsonl
 ```
 
-The sidebar filter is All / Claude / Codex / Other. Grok and any runtime that is not Claude or Codex appear under Other.
-
-Claude transcripts and Codex rollouts are converted into a common event format so the graph, heatmap, message log, and metrics can process them consistently.
+Claude, Codex, and Grok sessions appear together in one list. Transcripts are converted into a common event format so the office, graph, heatmap, message log, and metrics can process them consistently.
 
 ## Local API
 
@@ -212,7 +214,7 @@ Claude transcripts and Codex rollouts are converted into a common event format s
 | `GET /` | Dashboard |
 | `GET /api/v1/health` | Check server health |
 | `GET /api/v1/sessions` | List sessions |
-| `GET /api/v1/sessions/:id` | Get session details |
+| `GET /api/v1/sessions/:id` | Get session details (office, graph, heatmap, messages, metrics) |
 | `GET /api/v1/stream` | Realtime SSE stream |
 | `POST /api/v1/hooks` | Receive Claude Code hook events |
 | `POST /api/v1/watch` | Track or replay a JSONL file |
@@ -225,7 +227,8 @@ All APIs bind only to `127.0.0.1`.
 - `server/transcript.mjs`: reads and normalizes Claude Code transcripts.
 - `server/codex.mjs`: reads Codex rollouts.
 - `server/grok.mjs`: reads Grok sessions (`updates.jsonl`).
-- `server/visual.mjs`: builds the graph, heatmap, messages, and metrics.
+- `server/visual.mjs`: builds the graph, heatmap, messages, metrics, and office.
+- `server/office.mjs`: compiles events into people, tickets, handoffs, and artifacts.
 - `public/app.js`: dashboard logic, graph rendering, and user interactions.
 - `public/style.css`: dashboard styling.
 - `bin/visualizer.mjs`: CLI for starting the server, replaying sessions, and installing the skill.
