@@ -602,6 +602,24 @@ function tailFile(filePath, runtime) {
   }
 }
 
+function claudeUserText(obj) {
+  const content = obj?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+function isClaudeHumanPrompt(obj) {
+  if (obj?.type !== "user" || obj.isMeta) return false;
+  if (obj.promptSource && obj.promptSource !== "typed") return false;
+  if (obj.origin?.kind && obj.origin.kind !== "human") return false;
+  return Boolean(claudeUserText(obj));
+}
+
 // Claude tail — parse new transcript lines into VisualEvents (simpler than hooks).
 function ingestClaudeLine(obj, filePath, seq, sid) {
   let s = sessions.get(sid) || seedSession("claude", sid, { filePath });
@@ -610,8 +628,13 @@ function ingestClaudeLine(obj, filePath, seq, sid) {
   const base = { runtime: "claude", sessionId: sid, ts, seq, parentId: obj.parentUuid || null };
   let ev = null;
 
-  if (obj.type === "user" && obj.promptSource === "typed" && !obj.isMeta && typeof obj.message?.content === "string") {
-    ev = { ...base, kind: "user_prompt", id: `tu${seq}`, turnId: obj.promptId || obj.uuid, label: obj.message.content.slice(0, 140), detail: obj.message.content };
+  if (isClaudeHumanPrompt(obj)) {
+    const text = claudeUserText(obj);
+    ev = {
+      ...base, kind: "user_prompt", id: `tu${seq}`,
+      turnId: obj.promptId || obj.uuid,
+      label: text.slice(0, 140), detail: text,
+    };
   } else if (obj.type === "assistant" && Array.isArray(obj.message?.content)) {
     for (const b of obj.message.content) {
       if (b?.type === "thinking") ev = { ...base, kind: "reasoning", id: `tth${seq}`, turnId: obj.parentUuid, label: "🧠 reasoning", detail: String(b.thinking || "").slice(0, 500) };
@@ -719,6 +742,7 @@ const server = http.createServer(async (req, res) => {
         const view = mergeTeamView(team);
         sCopy.office = view.office;
         sCopy.heatmap = view.heatmap;
+        if (view.graph) sCopy.graph = view.graph;
       } else {
         const override = s.meta.roleOverride;
         const hod = s.meta.team?.hodRole;

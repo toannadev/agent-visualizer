@@ -49,6 +49,9 @@ a { color: var(--accent); text-decoration: none; }
 .sidebar-head small { color: var(--muted); font-weight: 400; margin-left: auto; font-size: 11px; }
 
 .sidebar-list { overflow-y: auto; flex: 1; min-height: 0; }
+.sidebar-more {
+  padding: 12px; text-align: center; color: var(--muted); font-size: 11px;
+}
 
 .session-item {
   padding: 10px 12px; border-bottom: 1px solid var(--border);
@@ -428,10 +431,7 @@ a { color: var(--accent); text-decoration: none; }
 }
 .office-desk:hover { border-color: var(--accent); }
 .office-desk.is-selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-.office-desk-user {
-  cursor: default;
-}
-.office-desk-user:hover { border-color: var(--border2); }
+.office-desk-user:hover { border-color: var(--accent); }
 .office-desk-top { display: flex; align-items: center; gap: 6px; }
 .office-desk-name { font-size: 12px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; }
 .office-role {
@@ -487,12 +487,32 @@ a { color: var(--accent); text-decoration: none; }
   left: 0;
   color: var(--muted);
 }
-.office-desk .office-assign-task {
+.office-assign-ask { min-width: 0; }
+.office-desk .office-assign-ask,
+.office-desk .office-assign-result {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.office-assign-result {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+  white-space: normal;
+}
+.office-desk .office-assign-result {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inspector-panel .office-assign-result {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .inspector-panel .office-assign-task,
+.inspector-panel .office-assign-ask,
+.inspector-panel .office-assign-result,
 .inspector-panel .inspector-work {
   white-space: pre-wrap;
   overflow: visible;

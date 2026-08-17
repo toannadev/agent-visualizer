@@ -13,6 +13,7 @@ const STUB_PROMPT = /^(write|read|edit|search|delete|bash|ok|yes|no|continue|sto
 export function emptyOffice() {
   return {
     brief: "",
+    briefs: [],
     outcome: "",
     directives: [],
     people: [blankPerson(LEAD, "lead")],
@@ -100,6 +101,7 @@ export function buildOffice(events = []) {
         durationMs: null,
       };
       closeTicket(openTicket.get(LEAD), ev.ts, "done");
+      attachTicketResult(openTicket.get(LEAD), people.get(LEAD));
       tickets.push(ticket);
       openTicket.set(LEAD, ticket);
       const lead = people.get(LEAD);
@@ -176,11 +178,17 @@ export function buildOffice(events = []) {
     addEvent(pid, ev);
 
     if (ev.kind === "agent_message") {
-      const text = oneLine(ev.detail || ev.label, 140);
+      const full = String(ev.detail || ev.label || "").trim();
+      const text = oneLine(full, 140);
       if (text && !isNoiseMessage(text)) {
         const p = people.get(pid);
         p.currentWork = text;
         if (pid === LEAD) outcome = text;
+        const ticket = openTicket.get(pid);
+        if (ticket) {
+          ticket.result = oneLine(full, 200);
+          ticket.resultFull = full;
+        }
       }
     }
     if (ev.kind === "tool_call") {
@@ -204,6 +212,7 @@ export function buildOffice(events = []) {
     for (const f of ev.filePaths || []) bumpFile(pid, f);
   }
 
+  attachTicketResult(openTicket.get(LEAD), people.get(LEAD));
   finalizeStatuses(people, { sawSessionEnd, openSubs, openTicket });
   applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPerson, tickets });
   applyWorkSummaries(people, brief, outcome);
@@ -214,6 +223,7 @@ export function buildOffice(events = []) {
   const artifacts = buildArtifacts(filesByPerson);
   return {
     brief,
+    briefs: collectUserBriefs(tickets),
     outcome: outcome && outcome !== brief ? outcome : "",
     directives,
     people: list,
@@ -385,6 +395,8 @@ function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPe
       .map((t) => ({
         title: t.title,
         full: t.full || t.title,
+        result: t.result || "",
+        resultFull: t.resultFull || t.result || "",
         status: t.status || "",
         startTs: t.startTs || "",
         endTs: t.endTs || null,
@@ -528,7 +540,36 @@ export function mergeTeamView(members = []) {
   return {
     office: mergeTeamOffice(live),
     heatmap: mergeHeatmaps(live.map((m) => m.heatmap || [])),
+    graph: mergeTeamGraphs(live),
   };
+}
+
+function linkEndId(value) {
+  if (value && typeof value === "object") return String(value.id ?? "");
+  return String(value ?? "");
+}
+
+function mergeTeamGraphs(members) {
+  const nodes = [];
+  const links = [];
+  for (const m of members) {
+    const sid = m.meta?.id;
+    if (!sid) continue;
+    const remap = new Map();
+    for (const n of m.graph?.nodes || []) {
+      if (!n?.id) continue;
+      const nid = `${sid}:${n.id}`;
+      remap.set(String(n.id), nid);
+      nodes.push({ ...n, id: nid, sessionId: sid, eventId: n.id });
+    }
+    for (const l of m.graph?.links || []) {
+      const source = remap.get(linkEndId(l.source));
+      const target = remap.get(linkEndId(l.target));
+      if (!source || !target) continue;
+      links.push({ kind: l.kind, source, target });
+    }
+  }
+  return { nodes, links };
 }
 
 /** One desk per live Herdr pane (or start-name). Keep the spawn's own session, not a newer chat. */
@@ -637,6 +678,8 @@ function mergeTeamOffice(members) {
       role: p.roleHint || "",
       task: oneLine(task.title || "", 160),
       full: task.full || task.title || "",
+      result: oneLine(task.result || "", 200),
+      resultFull: task.resultFull || task.result || "",
       status: task.status || p.status || "",
     })).filter((a) => a.task);
   });
@@ -646,6 +689,7 @@ function mergeTeamOffice(members) {
 
   return {
     brief: src.brief || workers.find((w) => w.office.brief)?.office.brief || "",
+    briefs: collectUserBriefs(src.tickets),
     outcome: src.outcome || workers.find((w) => w.office.outcome)?.office.outcome || "",
     directives: [...(src.directives || []), ...workers.flatMap((w) => w.office.directives || [])],
     people,
@@ -747,19 +791,51 @@ function spawnTasks(member) {
     .map((t) => ({
       title: oneLine(t.full || t.title, 160),
       full: String(t.full || t.title || "").trim(),
+      result: oneLine(t.resultFull || t.result || "", 200),
+      resultFull: String(t.resultFull || t.result || "").trim(),
       status: t.status || "",
       startTs: t.startTs || "",
       endTs: t.endTs || null,
     }));
   if (briefs.length) return briefs;
   const title = spawnTaskTitle(member);
+  const result = spawnWorkText(member);
   return title ? [{
     title,
     full: title,
+    result: result && result !== title ? result : "",
+    resultFull: result && result !== title ? result : "",
     status: staffStatusToTicket(member),
     startTs: member.meta?.startedAt || "",
     endTs: null,
   }] : [];
+}
+
+function attachTicketResult(ticket, person) {
+  if (!ticket || ticket.result) return;
+  const work = String(person?.currentWork || "").trim();
+  if (!work || work === ticket.title) return;
+  ticket.result = oneLine(work, 200);
+  ticket.resultFull = work;
+}
+
+function collectUserBriefs(tickets = []) {
+  const out = [];
+  const seen = new Set();
+  for (const t of tickets || []) {
+    if (!t || t.fromId !== USER || !t.title) continue;
+    const full = String(t.full || t.title || "").trim();
+    if (STUB_PROMPT.test(full)) continue;
+    const key = full.replace(/\s+/g, " ").toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      title: oneLine(full, 160),
+      full,
+      status: t.status || "",
+    });
+  }
+  return out;
 }
 
 function spawnTaskTitle(member) {

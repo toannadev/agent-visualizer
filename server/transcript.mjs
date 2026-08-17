@@ -57,13 +57,10 @@ function extractUserText(content) {
 }
 
 function isHumanPrompt(ev) {
-  return (
-    ev.type === "user" &&
-    !ev.isMeta &&
-    ev.promptSource === "typed" &&
-    ev.origin?.kind === "human" &&
-    typeof ev.message?.content !== "undefined"
-  );
+  if (ev.type !== "user" || ev.isMeta) return false;
+  if (ev.promptSource && ev.promptSource !== "typed") return false;
+  if (ev.origin?.kind && ev.origin.kind !== "human") return false;
+  return extractUserText(ev.message?.content).trim().length > 0;
 }
 
 function isToolResultUser(ev) {

@@ -73,6 +73,7 @@
     focusedPerson: null,
     es: null,
     pollTimer: null,
+    sidebarLimit: 20,
   };
 
   // ---------- fetch ----------
@@ -195,19 +196,52 @@
     for (const f of ["all", "claude", "codex", "grok"]) {
       const label = f === "all" ? "All" : f;
       const b = el("button", `rt-tab ${state.runtimeFilter === f ? "active" : ""}`, label);
-      b.onclick = () => { state.runtimeFilter = f; renderSidebar(); };
+      b.onclick = () => {
+        state.runtimeFilter = f;
+        state.sidebarLimit = 20;
+        renderSidebar();
+      };
       filterRow.appendChild(b);
     }
     box.appendChild(filterRow);
 
-    const { groups, loose } = groupSessions(state.sessions);
-    const shownGroups = groups.filter((g) => g.members.some(matchesRuntime));
-    const shownLoose = loose.filter(matchesRuntime);
-    if (!shownGroups.length && !shownLoose.length) {
+    const items = sidebarItems();
+    if (!items.length) {
       box.appendChild(el("div", "empty", "No sessions."));
+      return;
     }
-    for (const g of shownGroups) box.appendChild(renderTeamItem(g));
-    for (const s of shownLoose) box.appendChild(renderSessionItem(s));
+    const limit = Math.min(state.sidebarLimit, items.length);
+    for (let i = 0; i < limit; i++) {
+      const it = items[i];
+      box.appendChild(it.type === "team" ? renderTeamItem(it.g) : renderSessionItem(it.s));
+    }
+    if (limit < items.length) {
+      const more = el("div", "sidebar-more", `Scroll for more · ${items.length - limit} left`);
+      more.id = "sidebar-sentinel";
+      box.appendChild(more);
+      observeSidebarMore();
+    }
+  }
+
+  function sidebarItems() {
+    const { groups, loose } = groupSessions(state.sessions);
+    return [
+      ...groups.filter((g) => g.members.some(matchesRuntime)).map((g) => ({ type: "team", g })),
+      ...loose.filter(matchesRuntime).map((s) => ({ type: "session", s })),
+    ];
+  }
+
+  function observeSidebarMore() {
+    const sent = $("#sidebar-sentinel");
+    const root = $("#sidebar");
+    if (!sent || !root) return;
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      io.disconnect();
+      state.sidebarLimit += 20;
+      renderSidebar();
+    }, { root, rootMargin: "80px" });
+    io.observe(sent);
   }
 
   function groupSessions(list) {
@@ -402,22 +436,19 @@
     };
 
     const officeBox = mkPanel(officePanelTitle(s.office), "office-panel");
+    const focus = forensicFocus(s.office);
     const graphBox = mkPanel(
-      state.focusedPerson
-        ? `Forensics · Execution Graph · ${personLabel(officePerson(s.office, state.focusedPerson))}`
-        : "Forensics · Execution Graph",
+      focus ? `Forensics · Execution Graph · ${personLabel(focus)}` : "Forensics · Execution Graph",
       "graph-panel",
     );
-    const heatTitle = state.focusedPerson
-      ? `Files · ${personLabel(officePerson(s.office, state.focusedPerson))}`
-      : "Files";
+    const heatTitle = focus ? `Files · ${personLabel(focus)}` : "Files";
     const heatBox = mkPanel(heatTitle);
     const msgBox = mkPanel(`Messages (${s.messages.length})`);
     wrap.appendChild(grid);
 
     renderOffice(officeBox, s.office);
     const files = focusedFiles(s.office, s.heatmap);
-    renderHeatmap(heatBox, files, { filtered: Boolean(state.focusedPerson) });
+    renderHeatmap(heatBox, files, { filtered: Boolean(focus) });
     renderMessageLog(msgBox, s.messages);
     try {
       renderGraph(graphBox, s.graph, { compact: true });
@@ -439,7 +470,13 @@
   }
 
   function officePerson(office, id) {
+    if (id === "user") return userPersonFromOffice(office);
     return (office?.people || []).find((p) => p.id === id) || null;
+  }
+
+  function forensicFocus(office) {
+    if (!state.focusedPerson || state.focusedPerson === "user") return null;
+    return officePerson(office, state.focusedPerson);
   }
 
   function personRuntime(p) {
@@ -484,9 +521,10 @@
   }
 
   function focusedFiles(office, heatmap) {
-    if (!state.focusedPerson || !office?.artifacts) return heatmap || [];
-    const person = officePerson(office, state.focusedPerson);
-    const allowed = new Set((person?.files || []).map((f) => f.path));
+    const person = forensicFocus(office);
+    if (!person) return heatmap || [];
+    const allowed = new Set((person.files || []).map((f) => f.path));
+    if (!allowed.size) return heatmap || [];
     return (heatmap || []).filter((f) => allowed.has(f.path));
   }
 
@@ -494,7 +532,7 @@
     const node = state.inspected;
     if (!node || !office) return;
     if (node.inspect === "person") {
-      const fresh = officePerson(office, node.id);
+      const fresh = node.id === "user" ? userPersonFromOffice(office) : officePerson(office, node.id);
       state.inspected = fresh ? { inspect: "person", ...fresh } : null;
     } else if (node.inspect === "artifact") {
       const fresh = (office.artifacts || []).find((a) => a.path === node.path);
@@ -553,7 +591,7 @@
     const floor = el("div", "office-floor");
 
     const userNode = el("div", "office-node");
-    userNode.appendChild(renderUserCard(office.brief));
+    userNode.appendChild(renderUserCard(office));
 
     if (lead) {
       const leadNode = el("div", "office-node");
@@ -644,12 +682,43 @@
     return box;
   }
 
-  function renderUserCard(brief) {
-    const card = el("div", "office-desk office-desk-user");
+  function userPersonFromOffice(office) {
+    const briefs = office?.briefs?.length
+      ? office.briefs
+      : (office?.brief ? [{ title: office.brief, full: office.brief }] : []);
+    return {
+      id: "user",
+      kind: "user",
+      label: "User",
+      status: "idle",
+      roleHint: "",
+      tasks: briefs,
+    };
+  }
+
+  function renderUserCard(office) {
+    const person = userPersonFromOffice(office);
+    const selected = state.focusedPerson === "user" ? " is-selected" : "";
+    const card = el("button", `office-desk office-desk-user${selected}`);
+    card.type = "button";
+    card.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      if (state.focusedPerson === "user" && state.inspected?.inspect === "person") {
+        clearOfficeFocus();
+      } else {
+        focusPerson(person);
+      }
+    });
     const top = el("div", "office-desk-top");
     top.appendChild(el("span", "office-desk-name", "User"));
     card.appendChild(top);
-    card.appendChild(el("div", "office-desk-work", displayWork(brief) || "asked"));
+    if (person.tasks.length) {
+      card.appendChild(renderAssignGroups(person.tasks.map((t) => ({
+        who: "", task: t.title, full: t.full || t.title, status: t.status,
+      })), { full: false }));
+    } else {
+      card.appendChild(el("div", "office-desk-work", "asked"));
+    }
     return card;
   }
 
@@ -680,7 +749,10 @@
 
     const assigns = person.kind === "lead"
       ? (person.assignments || [])
-      : (person.tasks || []).map((t) => ({ who: "", task: t.title, full: t.full || t.title, status: t.status }));
+      : (person.tasks || []).map((t) => ({
+        who: "", task: t.title, full: t.full || t.title,
+        result: t.result, resultFull: t.resultFull, status: t.status,
+      }));
     if (assigns.length) {
       card.appendChild(renderAssignGroups(assigns, { full: false }));
     } else {
@@ -717,12 +789,16 @@
       const list = el("ul", "office-assign-list");
       for (const a of g.items) {
         const item = el("li", `office-assign-task ${a.status || ""}`);
-        item.appendChild(document.createTextNode(full
+        const ask = el("div", "office-assign-ask");
+        ask.textContent = full
           ? String(a.full || a.task || "").trim()
-          : displayWork(a.task) || ""));
+          : displayWork(a.task) || "";
         if (full && a.status) {
-          item.appendChild(el("span", `badge ${a.status} inspector-assign-status`, a.status));
+          ask.appendChild(el("span", `badge ${a.status} inspector-assign-status`, a.status));
         }
+        item.appendChild(ask);
+        const result = full ? String(a.resultFull || a.result || "").trim() : displayWork(a.result || "");
+        if (result) item.appendChild(el("div", "office-assign-result", result));
         list.appendChild(item);
       }
       group.appendChild(list);
@@ -970,15 +1046,18 @@
   }
 
   function focusedEventIds() {
-    if (!state.focusedPerson) return null;
-    const person = officePerson(state.detail?.office, state.focusedPerson);
-    return person?.eventIds?.length ? new Set(person.eventIds) : new Set();
+    const person = forensicFocus(state.detail?.office);
+    if (!person?.eventIds?.length) return null;
+    return new Set(person.eventIds);
   }
 
   function nodeBelongsToFocus(node, focusIds) {
+    const person = forensicFocus(state.detail?.office);
+    if (person?.sessionId && node.sessionId) {
+      return node.sessionId === person.sessionId;
+    }
     if (!focusIds) return true;
-    if (node.kind === "session_root") return true;
-    if (focusIds.has(node.id)) return true;
+    if (focusIds.has(node.id) || focusIds.has(node.eventId)) return true;
     if (state.focusedPerson === "lead" && node.kind === "user_prompt") return true;
     if (node.agentId && node.agentId === state.focusedPerson) return true;
     return false;
@@ -1169,13 +1248,20 @@
   }
 
   function renderPersonInspector(panel, person) {
-    inspectorChrome(panel, person.status, roleBadgeText(person) || person.kind, personLabel(person), {
-      role: effectiveRole(person),
-    });
+    if (person.kind === "user") {
+      inspectorChrome(panel, "", "user", "User");
+    } else {
+      inspectorChrome(panel, person.status, roleBadgeText(person) || person.kind, personLabel(person), {
+        role: effectiveRole(person),
+      });
+    }
     const body = el("div", "inspector-body");
     const assigns = person.kind === "lead"
       ? (person.assignments || [])
-      : (person.tasks || []).map((t) => ({ who: "", task: t.title, full: t.full || t.title, status: t.status }));
+      : (person.tasks || []).map((t) => ({
+        who: "", task: t.title, full: t.full || t.title,
+        result: t.result, resultFull: t.resultFull, status: t.status,
+      }));
     if (assigns.length) {
       body.appendChild(renderAssignGroups(assigns, { full: true }));
     } else if (person.currentWork) {
