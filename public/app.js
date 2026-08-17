@@ -728,23 +728,13 @@
     agent_message: "#3fb950", tool_call: "#79c0ff", tool_output: "#3fb950",
     subagent_start: "#f778ba", subagent_stop: "#f778ba", session_end: "#8b949e", error: "#f85149",
   };
+  const GRAPH_VISIBLE_KINDS = new Set([
+    "session_root", "user_prompt", "agent_message", "tool_call", "error", "subagent_start",
+  ]);
   let graphSim = null;
 
   function graphNodeId(value) {
     return typeof value === "object" ? value?.id : value;
-  }
-
-  function clipLabel(text, max = 42) {
-    const s = String(text || "").replace(/\s+/g, " ").trim();
-    if (!s) return "";
-    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
-  }
-
-  function fileBase(node) {
-    const path = node?.filePaths?.[0]?.path || "";
-    if (!path) return "";
-    const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-    return i >= 0 ? path.slice(i + 1) : path;
   }
 
   function isGraphNoise(node) {
@@ -757,159 +747,59 @@
     return false;
   }
 
-  // Story graph: one prompt → grouped tools → one reply. Hides chatter.
+  // Keep the execution graph readable while retaining the full data elsewhere.
   function simplifyGraph(graph) {
-    const raw = [...(graph?.nodes || [])]
+    const sourceNodes = graph?.nodes || [];
+    const nodes = sourceNodes
+      .filter((node) => GRAPH_VISIBLE_KINDS.has(node.kind))
+      // The synthetic root already represents the session start.
       .filter((node) => node.kind !== "session_root" || node.id === "root")
       .filter((node) => !isGraphNoise(node))
-      .sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+      .map((node) => ({ ...node }));
+    const visibleIds = new Set(nodes.map((node) => node.id));
+    const outgoing = new Map();
 
-    const nodes = [];
+    for (const link of graph?.links || []) {
+      const source = graphNodeId(link.source);
+      const target = graphNodeId(link.target);
+      if (!source || !target) continue;
+      if (!outgoing.has(source)) outgoing.set(source, []);
+      outgoing.get(source).push({ target, kind: link.kind });
+    }
+
     const links = [];
-    const add = (node) => { nodes.push(node); return node; };
-    const connect = (source, target, kind = "flow") => {
-      if (!source || !target || source === target) return;
+    const linkKeys = new Set();
+    const addLink = (source, target, kind) => {
+      if (!visibleIds.has(source) || !visibleIds.has(target) || source === target) return;
+      const key = `${source}\u0000${target}`;
+      if (linkKeys.has(key)) return;
+      linkKeys.add(key);
       links.push({ source, target, kind });
     };
 
-    const rootSrc = raw.find((n) => n.id === "root") || { id: "root", ts: raw[0]?.ts };
-    const root = add({
-      ...rootSrc,
-      id: "root",
-      kind: "session_root",
-      label: "Start",
-    });
-
-    let prompt = root;
-    const buckets = new Map();
-    let lastReply = null;
-
-    const flushTools = () => {
-      const rows = [...buckets.values()]
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 5);
-      for (const row of rows) {
-        const file = row.file && row.count === 1 ? ` ${row.file}` : "";
-        const count = row.count > 1 ? ` ×${row.count}` : "";
-        const node = add({
-          id: `story-tool:${prompt.id}:${row.name}`,
-          kind: row.error ? "error" : "tool_call",
-          label: `${row.name}${file}${count}`,
-          toolName: row.name,
-          ts: row.ts,
-          status: row.error ? "error" : "completed",
-          eventIds: row.ids,
-        });
-        connect(prompt.id, node.id, "tool");
+    for (const node of nodes) {
+      const pending = [...(outgoing.get(node.id) || [])];
+      const visited = new Set();
+      while (pending.length) {
+        const next = pending.pop();
+        if (!next || visited.has(next.target)) continue;
+        visited.add(next.target);
+        if (visibleIds.has(next.target)) {
+          addLink(node.id, next.target, next.kind);
+        } else {
+          pending.push(...(outgoing.get(next.target) || []));
+        }
       }
-      buckets.clear();
-    };
-
-    const flushReply = () => {
-      if (!lastReply || prompt.id === "root") { lastReply = null; return; }
-      const node = add({
-        ...lastReply,
-        id: `story-reply:${prompt.id}`,
-        kind: "agent_message",
-        label: clipLabel(lastReply.detail || lastReply.label, 48) || "Reply",
-      });
-      connect(prompt.id, node.id, "reply");
-      lastReply = null;
-    };
-
-    for (const src of raw) {
-      if (src.kind === "session_root" || src.id === "root") continue;
-      if (src.kind === "user_prompt") {
-        flushTools();
-        flushReply();
-        prompt = add({
-          ...src,
-          label: clipLabel(src.detail || src.label, 48) || "Prompt",
-        });
-        connect(root.id, prompt.id, "turn");
-        continue;
-      }
-      if (src.kind === "tool_call") {
-        const name = src.toolName || "tool";
-        const rec = buckets.get(name) || { name, count: 0, file: "", ts: src.ts, error: false, ids: [] };
-        rec.count += 1;
-        rec.file = rec.file || fileBase(src);
-        rec.ids.push(src.id);
-        buckets.set(name, rec);
-        continue;
-      }
-      if (src.kind === "error" || src.kind === "tool_error") {
-        const name = src.toolName || "error";
-        const rec = buckets.get(name) || { name, count: 0, file: "", ts: src.ts, error: true, ids: [] };
-        rec.count += 1;
-        rec.error = true;
-        rec.ids.push(src.id);
-        buckets.set(name, rec);
-        continue;
-      }
-      if (src.kind === "subagent_start") {
-        flushTools();
-        const node = add({
-          ...src,
-          label: clipLabel(src.label || src.agentId || "Subagent", 36),
-        });
-        connect(prompt.id, node.id, "parent");
-        continue;
-      }
-      if (src.kind === "agent_message") lastReply = src;
     }
-    flushTools();
-    flushReply();
+
     return { nodes, links };
-  }
-
-  function layoutStory(nodes, links, width) {
-    const kids = new Map();
-    for (const n of nodes) kids.set(n.id, []);
-    for (const l of links) {
-      const s = graphNodeId(l.source);
-      const t = graphNodeId(l.target);
-      if (kids.has(s)) kids.get(s).push(t);
-    }
-    const byId = new Map(nodes.map((n) => [n.id, n]));
-    const root = byId.get("root") || nodes[0];
-    const col = Math.max(280, width - 48);
-    let y = 36;
-    if (root) {
-      root.x = width / 2;
-      root.y = y;
-      y += 72;
-    }
-    const prompts = (kids.get(root?.id) || []).map((id) => byId.get(id)).filter(Boolean);
-    for (const prompt of prompts) {
-      prompt.x = width / 2;
-      prompt.y = y;
-      y += 58;
-      const children = (kids.get(prompt.id) || []).map((id) => byId.get(id)).filter(Boolean);
-      const tools = children.filter((n) => n.kind === "tool_call" || n.kind === "error" || n.kind === "subagent_start");
-      const replies = children.filter((n) => n.kind === "agent_message");
-      if (tools.length) {
-        const gap = Math.min(168, Math.max(110, col / Math.max(tools.length, 1)));
-        tools.forEach((n, i) => {
-          n.x = width / 2 + (i - (tools.length - 1) / 2) * gap;
-          n.y = y;
-        });
-        y += 58;
-      }
-      for (const reply of replies) {
-        reply.x = width / 2;
-        reply.y = y;
-        y += 64;
-      }
-    }
-    return Math.max(280, y + 24);
   }
 
   function addGraphLegend(box) {
     const legend = el("div", "graph-legend");
     const items = [
-      ["session_root", "Start"], ["user_prompt", "Prompt"], ["tool_call", "Tool"],
-      ["agent_message", "Reply"], ["subagent_start", "Subagent"], ["error", "Error"],
+      ["session_root", "Start"], ["user_prompt", "Prompt"], ["agent_message", "Agent"],
+      ["tool_call", "Tool"], ["subagent_start", "Subagent"], ["error", "Error"],
     ];
     for (const [kind, label] of items) {
       const item = el("span", "graph-legend-item");
@@ -919,38 +809,44 @@
       item.appendChild(document.createTextNode(label));
       legend.appendChild(item);
     }
-    legend.appendChild(el("span", "graph-legend-note", "Prompt → tools → reply"));
+    legend.appendChild(el("span", "graph-legend-note", "(reasoning, tool results, and end nodes hidden)"));
     box.appendChild(legend);
   }
 
   function renderGraph(box, graph, opts = {}) {
-    renderStoryGraph(box, graph, opts);
-  }
-
-  function renderStoryGraph(box, graph, opts = {}) {
     box.innerHTML = "";
-    if (graphSim) { graphSim.stop(); graphSim = null; }
     const displayGraph = simplifyGraph(graph);
     addGraphLegend(box);
     const wrap = el("div", `graph-wrap${opts.compact ? " graph-wrap-forensics" : ""}`);
     box.appendChild(wrap);
     if (!displayGraph.nodes.length) { wrap.appendChild(el("div", "empty", "No data.")); return; }
 
-    const width = Math.max(420, wrap.clientWidth || 640);
-    const height = layoutStory(displayGraph.nodes, displayGraph.links, width);
+    const width = Math.max(360, wrap.clientWidth || 640);
+    const height = opts.compact ? 420 : 540;
     const focusIds = focusedEventIds();
-    const byId = new Map(displayGraph.nodes.map((n) => [n.id, n]));
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     wrap.appendChild(svg);
+
+    const nodes = displayGraph.nodes;
+    const links = displayGraph.links;
+    const sim = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(links).id((d) => d.id).distance(50).strength(0.5))
+      .force("charge", d3.forceManyBody().strength(-240))
+      .force("center", d3.forceCenter(width / 2, height / 2))
+      .force("collide", d3.forceCollide(24));
 
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
     svg.appendChild(g);
     let zoom = 1, panX = 0, panY = 0, panState = null;
     const applyTransform = () => g.setAttribute("transform", `translate(${panX} ${panY}) scale(${zoom})`);
+    const toGraphPoint = (evt) => {
+      const rect = svg.getBoundingClientRect();
+      return { x: (evt.clientX - rect.left - panX) / zoom, y: (evt.clientY - rect.top - panY) / zoom };
+    };
     svg.addEventListener("wheel", (evt) => {
       evt.preventDefault();
-      zoom = Math.min(2.4, Math.max(0.45, zoom * (evt.deltaY < 0 ? 1.08 : 0.92)));
+      zoom = Math.min(3, Math.max(0.3, zoom * (evt.deltaY < 0 ? 1.08 : 0.92)));
       applyTransform();
     }, { passive: false });
     svg.addEventListener("pointerdown", (evt) => {
@@ -969,50 +865,76 @@
       svg.releasePointerCapture?.(evt.pointerId);
     });
 
-    for (const link of displayGraph.links) {
-      const source = byId.get(graphNodeId(link.source));
-      const target = byId.get(graphNodeId(link.target));
-      if (!source || !target) continue;
-      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-      line.classList.add("g-link");
-      line.setAttribute("x1", String(source.x));
-      line.setAttribute("y1", String(source.y));
-      line.setAttribute("x2", String(target.x));
-      line.setAttribute("y2", String(target.y));
-      g.appendChild(line);
-    }
-
-    for (const n of displayGraph.nodes) {
+    const nodeEls = [];
+    nodes.forEach((n) => {
       const gn = document.createElementNS("http://www.w3.org/2000/svg", "g");
       gn.classList.add("g-node");
       if (focusIds && !nodeBelongsToFocus(n, focusIds)) gn.classList.add("is-dim");
-      const label = n.label || n.id;
-      const w = Math.min(280, Math.max(72, 14 + label.length * 7.1));
-      const h = n.kind === "user_prompt" || n.kind === "agent_message" ? 28 : 24;
-      const pill = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      pill.setAttribute("x", String(-w / 2));
-      pill.setAttribute("y", String(-h / 2));
-      pill.setAttribute("width", String(w));
-      pill.setAttribute("height", String(h));
-      pill.setAttribute("rx", "12");
-      pill.setAttribute("fill", KIND_COLOR[n.kind] || "#8b949e");
-      pill.setAttribute("fill-opacity", n.kind === "session_root" ? "0.95" : "0.22");
-      pill.setAttribute("stroke", KIND_COLOR[n.kind] || "#8b949e");
-      pill.setAttribute("stroke-width", n.kind === "error" ? "1.6" : "1");
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("r", n.kind === "session_root" ? "10" : n.kind === "user_prompt" ? "8" : "7");
+      c.setAttribute("fill", KIND_COLOR[n.kind] || "#8b949e");
+      if (n.status === "running") c.style.animation = "pulse 1.4s infinite";
+      if (n.kind === "error") c.style.stroke = "var(--red)";
       const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      t.setAttribute("text-anchor", "middle");
+      t.setAttribute("x", "12");
       t.setAttribute("y", "4");
-      t.textContent = label;
-      gn.appendChild(pill);
+      t.textContent = (n.label || n.id).slice(0, 30);
+      gn.appendChild(c);
       gn.appendChild(t);
-      gn.setAttribute("transform", `translate(${n.x} ${n.y})`);
+      let dragging = null;
+      gn.addEventListener("pointerdown", (evt) => {
+        evt.stopPropagation();
+        gn.setPointerCapture?.(evt.pointerId);
+        dragging = { moved: false };
+        n.fx = n.x;
+        n.fy = n.y;
+        sim.alphaTarget(0.25).restart();
+      });
+      gn.addEventListener("pointermove", (evt) => {
+        if (!dragging) return;
+        const p = toGraphPoint(evt);
+        n.fx = p.x;
+        n.fy = p.y;
+        dragging.moved = true;
+      });
       gn.addEventListener("pointerup", (evt) => {
-        if (evt.detail > 1) return;
-        state.inspected = n;
-        renderInspector();
+        if (!dragging) return;
+        const wasMoved = dragging.moved;
+        dragging = null;
+        n.fx = null;
+        n.fy = null;
+        sim.alphaTarget(0);
+        gn.releasePointerCapture?.(evt.pointerId);
+        if (!wasMoved) { state.inspected = n; renderInspector(); }
       });
       g.appendChild(gn);
-    }
+      nodeEls.push({ g: gn, n });
+    });
+
+    const lineEls = [];
+    links.forEach(() => {
+      const l = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      l.classList.add("g-link");
+      g.insertBefore(l, g.firstChild);
+      lineEls.push(l);
+    });
+    sim.on("tick", () => {
+      lineEls.forEach((l, i) => {
+        const d = links[i];
+        const source = typeof d.source === "object" ? d.source : nodes.find((n) => n.id === d.source);
+        const target = typeof d.target === "object" ? d.target : nodes.find((n) => n.id === d.target);
+        if (!source || !target) return;
+        l.setAttribute("x1", String(source.x ?? 0));
+        l.setAttribute("y1", String(source.y ?? 0));
+        l.setAttribute("x2", String(target.x ?? 0));
+        l.setAttribute("y2", String(target.y ?? 0));
+      });
+      nodeEls.forEach(({ g: gn, n }) => {
+        gn.setAttribute("transform", `translate(${n.x ?? 0},${n.y ?? 0})`);
+      });
+    });
+    if (graphSim) graphSim.stop();
+    graphSim = sim;
   }
 
   function focusedEventIds() {
@@ -1025,13 +947,100 @@
     if (!focusIds) return true;
     if (node.kind === "session_root") return true;
     if (focusIds.has(node.id)) return true;
-    if (node.eventIds?.some((id) => focusIds.has(id))) return true;
     if (state.focusedPerson === "lead" && node.kind === "user_prompt") return true;
     if (node.agentId && node.agentId === state.focusedPerson) return true;
     return false;
   }
   function renderStaticGraph(box, graph) {
-    renderStoryGraph(box, graph, {});
+    box.innerHTML = "";
+    const displayGraph = simplifyGraph(graph);
+    addGraphLegend(box);
+    const wrap = el("div", "graph-wrap");
+    box.appendChild(wrap);
+    const nodes = displayGraph.nodes;
+    if (!nodes.length) { wrap.appendChild(el("div", "empty", "No data.")); return; }
+    const width = Math.max(360, wrap.clientWidth || 640), height = 540;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    wrap.appendChild(svg);
+    const byDepth = new Map();
+    for (const n of nodes) {
+      const depth = Number(n.depth) || 0;
+      if (!byDepth.has(depth)) byDepth.set(depth, []);
+      byDepth.get(depth).push(n);
+    }
+    const maxDepth = Math.max(0, ...nodes.map((n) => Number(n.depth) || 0));
+    const gapY = Math.max(42, Math.min(90, (height - 40) / Math.max(1, maxDepth + 1)));
+    for (const [depth, group] of byDepth) {
+      const gapX = width / (group.length + 1);
+      group.forEach((n, i) => { n.x = gapX * (i + 1); n.y = 25 + depth * gapY; });
+    }
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    svg.appendChild(g);
+    let scale = 1, panX = 0, panY = 0, panning = null, dragging = null;
+    const applyTransform = () => g.setAttribute("transform", `translate(${panX} ${panY}) scale(${scale})`);
+    const point = (e) => {
+      const r = svg.getBoundingClientRect();
+      return { x: (e.clientX - r.left - panX) / scale, y: (e.clientY - r.top - panY) / scale };
+    };
+    const lineEls = [];
+    for (const link of displayGraph.links) {
+      const source = byId.get(typeof link.source === "object" ? link.source.id : link.source);
+      const target = byId.get(typeof link.target === "object" ? link.target.id : link.target);
+      if (!source || !target) continue;
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.classList.add("g-link");
+      g.appendChild(line);
+      lineEls.push({ line, source, target });
+    }
+    const nodeEls = [];
+    const update = () => {
+      for (const { line, source, target } of lineEls) {
+        line.setAttribute("x1", String(source.x)); line.setAttribute("y1", String(source.y));
+        line.setAttribute("x2", String(target.x)); line.setAttribute("y2", String(target.y));
+      }
+      for (const { group, node } of nodeEls) group.setAttribute("transform", `translate(${node.x} ${node.y})`);
+    };
+    for (const node of nodes) {
+      const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      group.classList.add("g-node");
+      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      circle.setAttribute("r", node.kind === "session_root" ? "10" : "7");
+      circle.setAttribute("fill", KIND_COLOR[node.kind] || "#8b949e");
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("x", "12"); text.setAttribute("y", "4"); text.textContent = (node.label || node.id).slice(0, 28);
+      group.appendChild(circle); group.appendChild(text); g.appendChild(group);
+      let moved = false;
+      group.addEventListener("pointerdown", (e) => {
+        e.stopPropagation(); group.setPointerCapture?.(e.pointerId); dragging = { node, moved: false };
+      });
+      group.addEventListener("pointermove", (e) => {
+        if (!dragging || dragging.node !== node) return;
+        const p = point(e); node.x = p.x; node.y = p.y; dragging.moved = true; update();
+      });
+      group.addEventListener("pointerup", (e) => {
+        if (dragging?.node === node) {
+          if (!dragging.moved) { state.inspected = node; renderInspector(); }
+          dragging = null; group.releasePointerCapture?.(e.pointerId);
+        }
+      });
+      nodeEls.push({ group, node });
+    }
+    svg.addEventListener("pointerdown", (e) => {
+      if (e.target !== svg) return;
+      panning = { x: e.clientX, y: e.clientY, panX, panY };
+      svg.setPointerCapture?.(e.pointerId);
+    });
+    svg.addEventListener("pointermove", (e) => {
+      if (!panning) return;
+      panX = panning.panX + e.clientX - panning.x; panY = panning.panY + e.clientY - panning.y; applyTransform();
+    });
+    svg.addEventListener("pointerup", (e) => { panning = null; svg.releasePointerCapture?.(e.pointerId); });
+    svg.addEventListener("wheel", (e) => {
+      e.preventDefault(); scale = Math.min(3, Math.max(0.3, scale * (e.deltaY < 0 ? 1.1 : 0.9))); applyTransform();
+    }, { passive: false });
+    update();
   }
 
   // ---------- heatmap ----------

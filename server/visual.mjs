@@ -109,7 +109,6 @@ function toNode(ev, seq) {
     parentId: ev.parentId || null,
     durationMs: ev.durationMs,
     toolName: ev.toolName,
-    filePaths: ev.filePaths || [],
     detail: ev.detail,
     turnId: ev.turnId,
     agentId: ev.agentId || null,
