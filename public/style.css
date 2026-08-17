@@ -59,6 +59,7 @@ a { color: var(--accent); text-decoration: none; }
 .session-item .s-top { display: flex; gap: 8px; align-items: center; }
 .session-item .s-title {
   font-size: 12.5px; font-weight: 600; color: var(--text);
+  margin-top: 4px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .session-item .s-meta { color: var(--muted); font-size: 11.5px; margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
@@ -67,11 +68,10 @@ a { color: var(--accent); text-decoration: none; }
   font-size: 10px; padding: 1px 8px; border-radius: 99px;
   white-space: nowrap; text-transform: uppercase; letter-spacing: 0.4px;
 }
-.badge.running { background: #1f6feb33; color: var(--accent); }
-.badge.idle { background: #2ea04333; color: var(--green); }
-.badge.error { background: #f8514933; color: var(--red); }
-.badge.completed { background: #2ea04333; color: var(--green); }
-.badge.in_progress { background: #1f6feb33; color: var(--accent); }
+.badge.running, .badge.doing, .badge.in_progress { background: #1f6feb33; color: var(--accent); }
+.badge.idle { background: #8b949e33; color: var(--muted); }
+.badge.error, .badge.blocked, .badge.failed { background: #f8514933; color: var(--red); }
+.badge.completed, .badge.done { background: #2ea04333; color: var(--green); }
 
 .main-content { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow-x: hidden; overflow-y: auto; }
 #detail { min-width: 0; }
@@ -206,10 +206,21 @@ a { color: var(--accent); text-decoration: none; }
 }
 .inspector-panel {
   background: var(--panel); border: 1px solid var(--border2); border-radius: 10px;
-  padding: 16px; width: 480px; max-width: 90vw; max-height: 80vh; overflow: auto;
+  padding: 16px; width: 480px; max-width: 90vw;
+  max-height: min(70vh, 560px); display: flex; flex-direction: column; overflow: hidden;
 }
-.inspector-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
-.inspector-kind { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+.inspector-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 4px;
+}
+.inspector-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.inspector-kind,
+.inspector-head .office-role {
+  font-size: 10px; padding: 2px 8px; border-radius: 99px;
+  border: 1px solid var(--border); text-transform: uppercase; letter-spacing: 0.4px;
+}
+.inspector-head .office-role { margin-left: 0; }
+.inspector-head .badge { padding: 2px 8px; }
+.inspector-assign-status { margin-left: 6px; vertical-align: middle; }
 .inspector-close { margin-left: auto; }
 .inspector-label { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 .inspector-row { font-size: 12px; color: var(--muted); margin-bottom: 3px; }
@@ -453,14 +464,40 @@ a { color: var(--accent); text-decoration: none; }
   overflow: hidden;
 }
 .office-desk-lead { width: 320px; }
-.office-assigns { display: flex; flex-direction: column; gap: 8px; }
-.office-assign { display: flex; flex-direction: column; gap: 2px; }
+.office-assigns { display: flex; flex-direction: column; gap: 10px; }
+.office-assign-group { display: flex; flex-direction: column; gap: 2px; }
 .office-assign-who {
   font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--muted);
 }
+.office-assign-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
 .office-assign-task {
-  font-size: 13px; line-height: 1.4;
+  position: relative;
+  font-size: 13px; line-height: 1.45;
+  margin: 3px 0;
+  padding-left: 0.95em;
+}
+.office-assign-task::before {
+  content: "•";
+  position: absolute;
+  left: 0;
+  color: var(--muted);
+}
+.office-desk .office-assign-task {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inspector-panel .office-assign-task,
+.inspector-panel .inspector-work {
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: unset;
+  word-break: break-word;
 }
 .office-tools { display: flex; flex-wrap: wrap; gap: 4px; }
 .office-tool {

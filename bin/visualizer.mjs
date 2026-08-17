@@ -56,6 +56,32 @@ async function cmdStart() {
   child.on("exit", (code) => process.exit(code ?? 0));
 }
 
+function herdrBin() {
+  return process.env.HERDR_BIN_PATH || process.env.HERDR_BIN || "herdr";
+}
+
+function runHerdr(args) {
+  const r = spawnSync(herdrBin(), args, { cwd: ROOT, stdio: "inherit" });
+  if (r.error?.code === "ENOENT") {
+    console.error("herdr not found on PATH. Install Herdr 0.8+ first: https://herdr.dev");
+    process.exit(1);
+  }
+  if (r.status) process.exit(r.status);
+}
+
+function cmdHerdrLink() {
+  console.log(`Linking ${ROOT} as Herdr plugin agent.visualizer`);
+  runHerdr(["plugin", "link", ROOT, "--enabled"]);
+  runHerdr(["plugin", "list"]);
+  console.log("Open:");
+  console.log("  herdr plugin action invoke agent.visualizer.open");
+  console.log("  herdr plugin pane open --plugin agent.visualizer --entrypoint agent-visualizer --direction down");
+}
+
+function cmdHerdrUnlink() {
+  runHerdr(["plugin", "unlink", "agent.visualizer"]);
+}
+
 // ---------- install-skill ----------
 function cmdInstallSkill() {
   const src = path.join(ROOT, "SKILL.md");
@@ -90,6 +116,13 @@ async function cmdReplay(filePath, runtime) {
 // ---------- main ----------
 const [cmd, ...args] = process.argv.slice(2);
 switch (cmd) {
+  case "herdr-link":
+  case "install-herdr":
+    cmdHerdrLink();
+    break;
+  case "herdr-unlink":
+    cmdHerdrUnlink();
+    break;
   case "install-skill":
     cmdInstallSkill();
     break;

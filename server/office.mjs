@@ -8,6 +8,7 @@ const USER = "user";
 
 const SUB_TOOLS = /^(Task|TaskCreate|spawn_subagent|subagent|Agent)$/i;
 const NOISE_PROMPT = /^<(environment_context|turn_aborted)\b/i;
+const STUB_PROMPT = /^(write|read|edit|search|delete|bash|ok|yes|no|continue|stop)$/i;
 
 export function emptyOffice() {
   return {
@@ -84,11 +85,13 @@ export function buildOffice(events = []) {
       const rawText = ev.detail || ev.label || "";
       const directive = parseRoleDirective(rawText);
       if (directive) directives.push(directive);
-      const title = oneLine(directive?.task || rawText, 140);
+      const raw = String(directive?.task || rawText).replace(/\s+/g, " ").trim();
+      const title = oneLine(raw, 140);
       if (title) brief = title;
       const ticket = {
         id: `brief-${ev.id || tickets.length}`,
         title: title || "User brief",
+        full: raw || title || "User brief",
         fromId: USER,
         toId: LEAD,
         status: "doing",
@@ -255,7 +258,11 @@ function matchOpenSub(ev, openSubs) {
 }
 
 function isNoisePrompt(ev) {
-  return NOISE_PROMPT.test(String(ev.label || ev.detail || "").trim());
+  const t = String(ev.label || ev.detail || "").trim();
+  if (!t) return true;
+  if (NOISE_PROMPT.test(t)) return true;
+  if (STUB_PROMPT.test(t)) return true;
+  return false;
 }
 
 function ticketTitleFromStart(ev) {
@@ -304,6 +311,7 @@ function blankPerson(id, kind) {
     roleSource: kind === "lead" ? "lead" : "unmapped",
     status: "idle",
     currentWork: "",
+    tasks: [],
     ticketId: null,
     tools: [],
     toolBelt: [],
@@ -360,7 +368,7 @@ function finalizeStatuses(people, { sawSessionEnd, openSubs }) {
   }
 }
 
-function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPerson }) {
+function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPerson, tickets }) {
   for (const p of people.values()) {
     const toolMap = toolsByPerson.get(p.id) || new Map();
     const belt = [...toolMap.entries()]
@@ -372,6 +380,15 @@ function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPe
     p.files = [...fileMap.values()].sort((a, b) => b.total - a.total);
     p.fileCount = p.files.length;
     p.eventIds = eventIdsByPerson.get(p.id) || [];
+    p.tasks = (tickets || [])
+      .filter((t) => t && t.toId === p.id && t.title)
+      .map((t) => ({
+        title: t.title,
+        full: t.full || t.title,
+        status: t.status || "",
+        startTs: t.startTs || "",
+        endTs: t.endTs || null,
+      }));
     const resolved = resolveRole({ kind: p.kind });
     p.roleHint = resolved.role;
     p.roleSource = resolved.roleSource;
@@ -577,25 +594,29 @@ function mergeTeamOffice(members) {
   const handoffs = [...(src.handoffs || [])];
   for (const w of workers) {
     const pid = herdrPersonId(w);
-    const title = spawnTaskTitle(w);
-    tickets.push({
-      id: `herdr-t-${w.meta.id}`,
-      title,
-      fromId: LEAD,
-      toId: pid,
-      status: staffStatusToTicket(w),
-      startTs: w.meta.startedAt || "",
-      endTs: w.meta.endedAt || null,
-      durationMs: null,
+    const tasks = spawnTasks(w);
+    tasks.forEach((task, i) => {
+      const tid = `herdr-t-${w.meta.id}-${i}`;
+      tickets.push({
+        id: tid,
+        title: task.title,
+        fromId: LEAD,
+        toId: pid,
+        status: task.status || staffStatusToTicket(w),
+        startTs: task.startTs || w.meta.startedAt || "",
+        endTs: task.endTs || null,
+        durationMs: null,
+      });
+      handoffs.push(makeHandoff("delegate", LEAD, pid, tid, task.title, task.startTs || w.meta.startedAt));
     });
-    handoffs.push(makeHandoff("delegate", LEAD, pid, `herdr-t-${w.meta.id}`, title, w.meta.startedAt));
     if (w.office.people?.[0]?.status === "done" || w.office.outcome) {
+      const last = tasks[tasks.length - 1];
       handoffs.push(makeHandoff(
         "return",
         pid,
         LEAD,
-        `herdr-t-${w.meta.id}`,
-        w.office.outcome || w.office.people?.[0]?.currentWork || "done",
+        last ? `herdr-t-${w.meta.id}-${tasks.length - 1}` : `herdr-t-${w.meta.id}-0`,
+        w.office.outcome || last?.title || "done",
         w.meta.mtimeMs ? new Date(w.meta.mtimeMs).toISOString() : "",
       ));
     }
@@ -607,15 +628,18 @@ function mergeTeamOffice(members) {
   ]);
 
   const delegated = [...staff];
-  lead.assignments = delegated.map((p) => {
-    const ticket = tickets.find((t) => t.toId === p.id);
-    return {
+  lead.assignments = delegated.flatMap((p) => {
+    const items = (p.tasks || []).length
+      ? p.tasks
+      : [{ title: p.currentWork, status: p.status }];
+    return items.map((task) => ({
       who: assignmentWho(p),
       role: p.roleHint || "",
-      task: oneLine(ticket?.title || p.currentWork || "", 100),
-      status: ticket?.status || p.status || "",
-    };
-  }).filter((a) => a.task);
+      task: oneLine(task.title || "", 160),
+      full: task.full || task.title || "",
+      status: task.status || p.status || "",
+    })).filter((a) => a.task);
+  });
   if (lead.assignments.length) {
     lead.currentWork = lead.assignments.map((a) => `${a.who}: ${a.task}`).join("\n");
   }
@@ -709,11 +733,33 @@ function personFromMember(member, directives = []) {
     roleHint: resolved.role,
     roleSource: resolved.source || resolved.roleSource,
     currentWork: spawnWorkText(member),
+    tasks: spawnTasks(member),
     ticketId: `herdr-t-${member.meta.id}`,
     sessionId: member.meta.id,
     runtime,
     herdrName: spawn,
   };
+}
+
+function spawnTasks(member) {
+  const briefs = (member.office?.tickets || [])
+    .filter((t) => t && t.fromId === USER && t.title && !STUB_PROMPT.test(String(t.full || t.title).trim()))
+    .map((t) => ({
+      title: oneLine(t.full || t.title, 160),
+      full: String(t.full || t.title || "").trim(),
+      status: t.status || "",
+      startTs: t.startTs || "",
+      endTs: t.endTs || null,
+    }));
+  if (briefs.length) return briefs;
+  const title = spawnTaskTitle(member);
+  return title ? [{
+    title,
+    full: title,
+    status: staffStatusToTicket(member),
+    startTs: member.meta?.startedAt || "",
+    endTs: null,
+  }] : [];
 }
 
 function spawnTaskTitle(member) {

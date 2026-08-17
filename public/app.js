@@ -307,8 +307,8 @@
     badge.appendChild(dot);
     badge.appendChild(document.createTextNode(status));
     top.appendChild(badge);
-    top.appendChild(el("div", "s-title", g.label || "team"));
     item.appendChild(top);
+    item.appendChild(el("div", "s-title", g.label || "team"));
     const meta = el("div", "s-meta");
     meta.appendChild(el("span", "", `${members.length} agents`));
     const names = [...new Set(members.map((s) => s.meta?.team?.herdrName).filter(Boolean))];
@@ -334,8 +334,8 @@
     badge.appendChild(dot);
     badge.appendChild(document.createTextNode(m.status));
     top.appendChild(badge);
-    top.appendChild(el("div", "s-title", m.title || m.cwd || m.projectDir || m.id));
     item.appendChild(top);
+    item.appendChild(el("div", "s-title", m.title || m.cwd || m.projectDir || m.id));
     const meta = el("div", "s-meta");
     meta.appendChild(el("span", "", `${s.metrics?.toolCount ?? 0} tool`));
     if (s.officeCounts?.doing) meta.appendChild(el("span", "", `${s.officeCounts.doing} doing`));
@@ -671,23 +671,18 @@
     top.appendChild(lamp);
     const runtime = personRuntime(person);
     if (runtime) top.appendChild(el("span", `rt-badge ${runtime}`, runtime));
-    const spawn = spawnName(person);
-    if (spawn) top.appendChild(el("span", "office-desk-name", spawn));
     const role = effectiveRole(person);
     const roleBadge = roleBadgeText(person);
     if (roleBadge) top.appendChild(el("span", `office-role role-${role}`, roleBadge));
     card.appendChild(top);
+    const spawn = spawnName(person);
+    if (spawn) card.appendChild(el("div", "office-desk-name", spawn));
 
-    const assigns = person.kind === "lead" ? (person.assignments || []) : [];
+    const assigns = person.kind === "lead"
+      ? (person.assignments || [])
+      : (person.tasks || []).map((t) => ({ who: "", task: t.title, full: t.full || t.title, status: t.status }));
     if (assigns.length) {
-      const list = el("div", "office-assigns");
-      for (const a of assigns) {
-        const row = el("div", `office-assign ${a.status || ""}`);
-        row.appendChild(el("span", "office-assign-who", a.who || "agent"));
-        row.appendChild(el("span", "office-assign-task", displayWork(a.task) || ""));
-        list.appendChild(row);
-      }
-      card.appendChild(list);
+      card.appendChild(renderAssignGroups(assigns, { full: false }));
     } else {
       card.appendChild(el("div", "office-desk-work", displayWork(person.currentWork) || "Idle"));
     }
@@ -697,6 +692,43 @@
     }
     card.classList.add(`office-desk-role-${role}`);
     return card;
+  }
+
+  function groupAssigns(assigns) {
+    const groups = [];
+    const byWho = new Map();
+    for (const a of assigns || []) {
+      const key = String(a.who || "");
+      if (!byWho.has(key)) {
+        const g = { who: a.who || "", items: [] };
+        byWho.set(key, g);
+        groups.push(g);
+      }
+      byWho.get(key).items.push(a);
+    }
+    return groups;
+  }
+
+  function renderAssignGroups(assigns, { full = false } = {}) {
+    const box = el("div", "office-assigns");
+    for (const g of groupAssigns(assigns)) {
+      const group = el("div", "office-assign-group");
+      if (g.who) group.appendChild(el("span", "office-assign-who", g.who));
+      const list = el("ul", "office-assign-list");
+      for (const a of g.items) {
+        const item = el("li", `office-assign-task ${a.status || ""}`);
+        item.appendChild(document.createTextNode(full
+          ? String(a.full || a.task || "").trim()
+          : displayWork(a.task) || ""));
+        if (full && a.status) {
+          item.appendChild(el("span", `badge ${a.status} inspector-assign-status`, a.status));
+        }
+        list.appendChild(item);
+      }
+      group.appendChild(list);
+      box.appendChild(group);
+    }
+    return box;
   }
 
   function effectiveRole(person) {
@@ -1107,56 +1139,17 @@
     document.body.appendChild(overlay);
   }
 
-  function inspectorChrome(panel, badge, kind, title) {
+  function inspectorChrome(panel, badge, kind, title, { role } = {}) {
     const head = el("div", "inspector-head");
     if (badge) head.appendChild(el("span", `badge ${badge}`, badge));
-    head.appendChild(el("span", "inspector-kind", kind));
+    if (kind) {
+      head.appendChild(el("span", role ? `office-role role-${role}` : "inspector-kind", kind));
+    }
     const close = el("button", "btn inspector-close", "✕");
     close.onclick = () => { state.inspected = null; renderInspector(); };
     head.appendChild(close);
     panel.appendChild(head);
     if (title) panel.appendChild(el("div", "inspector-label", title));
-  }
-
-  const ROLE_OPTIONS = [
-    ["lead", "Lead"],
-    ["worker", "Worker"],
-    ["impl", "Impl"],
-    ["review", "Reviewer"],
-    ["advisor", "Advisor"],
-    ["tester", "Tester"],
-  ];
-
-  function renderRolePicker(person) {
-    const row = el("div", "inspector-row inspector-role-pick");
-    row.appendChild(el("span", "", "role: "));
-    const sel = el("select", "replay-select inspector-role");
-    for (const [value, label] of ROLE_OPTIONS) {
-      const o = el("option", "", label);
-      o.value = value;
-      if (effectiveRole(person) === value) o.selected = true;
-      sel.appendChild(o);
-    }
-    sel.onchange = async () => {
-      const sid = person.sessionId || state.selectedId;
-      if (!sid) return;
-      try {
-        await api(`/api/v1/sessions/${encodeURIComponent(sid)}/role`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ role: sel.value }),
-        });
-        await loadDetail(state.selectedId);
-      } catch (err) {
-        sel.blur();
-        console.error(err);
-      }
-    };
-    row.appendChild(sel);
-    const srcLabel = { hod: "herdr", name: "start", user: "user", lead: "lead", unmapped: "unmapped" };
-    const src = srcLabel[person.roleSource] || person.roleSource || "unmapped";
-    row.appendChild(el("span", "muted", ` · ${src}`));
-    return row;
   }
 
   function inspectorRow(label, value) {
@@ -1176,40 +1169,22 @@
   }
 
   function renderPersonInspector(panel, person) {
-    inspectorChrome(panel, person.status, person.kind === "lead" ? "lead" : "subagent", personLabel(person));
-    panel.appendChild(inspectorRow("id", person.id));
-    if (personRuntime(person)) panel.appendChild(inspectorRow("runtime", prettyRuntime(personRuntime(person)) || personRuntime(person)));
-    const spawn = spawnName(person);
-    if (spawn && spawn !== personLabel(person)) panel.appendChild(inspectorRow("spawn", spawn));
-    panel.appendChild(renderRolePicker(person));
-    if (person.currentWork) panel.appendChild(inspectorRow("work", displayWork(person.currentWork)));
-    panel.appendChild(el("div", "inspector-note", "Attribution is best-effort from the session log."));
-
-    if (person.toolBelt?.length) {
-      panel.appendChild(el("div", "inspector-sub", "Tool belt"));
-      const belt = el("div", "office-tools");
-      for (const t of person.toolBelt) {
-        belt.appendChild(el("span", "office-tool", `${t.name} ${t.count}`));
-      }
-      panel.appendChild(belt);
+    inspectorChrome(panel, person.status, roleBadgeText(person) || person.kind, personLabel(person), {
+      role: effectiveRole(person),
+    });
+    const body = el("div", "inspector-body");
+    const assigns = person.kind === "lead"
+      ? (person.assignments || [])
+      : (person.tasks || []).map((t) => ({ who: "", task: t.title, full: t.full || t.title, status: t.status }));
+    if (assigns.length) {
+      body.appendChild(renderAssignGroups(assigns, { full: true }));
+    } else if (person.currentWork) {
+      body.appendChild(el("div", "inspector-work", String(person.currentWork).trim()));
     }
-
-    if (person.files?.length) {
-      panel.appendChild(el("div", "inspector-sub", "Files"));
-      for (const f of person.files.slice(0, 12)) {
-        panel.appendChild(inspectorRow(f.path, `${f.read || 0}r ${f.write || 0}w ${f.edit || 0}e`));
-      }
+    if (person.errorCount) {
+      body.appendChild(el("div", "office-desk-meta office-err", `${person.errorCount} err`));
     }
-
-    const hops = (state.detail?.office?.handoffs || [])
-      .filter((h) => h.fromId === person.id || h.toId === person.id)
-      .slice(-3);
-    if (hops.length) {
-      panel.appendChild(el("div", "inspector-sub", "Recent handoffs"));
-      for (const h of hops) {
-        panel.appendChild(el("div", "inspector-row", `${h.kind}: ${h.fromId} → ${h.toId}${h.summary ? " · " + h.summary : ""}`));
-      }
-    }
+    panel.appendChild(body);
   }
 
   function renderArtifactInspector(panel, art) {

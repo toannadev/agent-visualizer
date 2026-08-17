@@ -15,6 +15,22 @@ npx agent-visualizer
 
 The browser opens `http://127.0.0.1:3002`. The sidebar lists Claude Code and Codex sessions and updates in realtime through SSE without a refresh. Select a session to view its office floor, graph, file heatmap, message log, and metrics. Click a desk to inspect that agent and filter files/graph to their work.
 
+Inside Herdr 0.8+:
+
+```bash
+# clone
+cd /path/to/agent-session-viewer
+npm install && npm run build
+herdr plugin link "$PWD" --enabled
+
+# hoặc đã cài global
+npm install --global agent-visualizer
+visualizer herdr-link
+
+herdr plugin pane open --plugin agent.visualizer --entrypoint agent-visualizer --direction down
+herdr plugin action invoke agent.visualizer.open
+```
+
 ## Zero-Latency Hooks (Optional)
 
 The tool works without hooks because the server tails transcripts roughly every 800ms. For immediate events:

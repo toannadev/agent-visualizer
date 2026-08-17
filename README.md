@@ -116,6 +116,84 @@ Restart Claude Code, then use:
 /agent-visualizer
 ```
 
+## Herdr plugin
+
+Requires Herdr 0.8+. Plugin id: `agent.visualizer`.
+
+### 1. From a clone (original)
+
+```bash
+cd /Users/toan/Desktop/agent-session-viewer
+npm install && npm run build
+herdr plugin link /Users/toan/Desktop/agent-session-viewer --enabled
+herdr plugin list
+```
+
+Same thing as one script:
+
+```bash
+npm run herdr:link
+```
+
+### 2. After a global npm install (no clone)
+
+```bash
+npm install --global agent-visualizer
+visualizer herdr-link
+```
+
+Or without installing globally:
+
+```bash
+npx agent-visualizer herdr-link
+```
+
+Unlink: `visualizer herdr-unlink` or `herdr plugin unlink agent.visualizer`.
+
+Herdr’s own `plugin install` only accepts GitHub (`owner/repo`), not npm. After the repo is public: `herdr plugin install owner/repo`.
+
+### Open
+
+Start the dashboard in a Herdr pane (server logs stay in that pane):
+
+```bash
+herdr plugin pane open --plugin agent.visualizer --entrypoint agent-visualizer --direction down
+herdr plugin pane open --plugin agent.visualizer --entrypoint agent-visualizer --direction right
+herdr plugin pane open --plugin agent.visualizer --entrypoint agent-visualizer --placement tab
+```
+
+Start in the background and open the browser (`http://127.0.0.1:3002`):
+
+```bash
+herdr plugin action invoke agent.visualizer.open
+```
+
+### Inspect / remove
+
+```bash
+herdr plugin action list --plugin agent.visualizer
+herdr plugin log list --plugin agent.visualizer
+herdr plugin disable agent.visualizer
+herdr plugin enable agent.visualizer
+herdr plugin unlink agent.visualizer
+```
+
+### Optional keybinding
+
+In `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+v"
+type = "plugin_action"
+command = "agent.visualizer.open"
+description = "open agent visualizer"
+```
+
+Then reload: `herdr server reload-config`.
+
+After the plugin is published, install with `herdr plugin install owner/repo` instead of `plugin link`.
+
 ## Build and Run from Source
 
 ```bash
