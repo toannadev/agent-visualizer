@@ -822,7 +822,7 @@
     if (!displayGraph.nodes.length) { wrap.appendChild(el("div", "empty", "No data.")); return; }
 
     const width = Math.max(360, wrap.clientWidth || 640);
-    const height = opts.compact ? 420 : 540;
+    const height = Math.max(opts.compact ? 520 : 640, wrap.clientHeight || 720);
     const focusIds = focusedEventIds();
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -959,7 +959,8 @@
     box.appendChild(wrap);
     const nodes = displayGraph.nodes;
     if (!nodes.length) { wrap.appendChild(el("div", "empty", "No data.")); return; }
-    const width = Math.max(360, wrap.clientWidth || 640), height = 540;
+    const width = Math.max(360, wrap.clientWidth || 640);
+    const height = Math.max(640, wrap.clientHeight || 720);
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     wrap.appendChild(svg);
