@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { recompute } from "./visual.mjs";
 import { emptyOffice, mergeTeamView, applyAssignedRole } from "./office.mjs";
-import { ASSIGNABLE_ROLES, canonicalizeRole } from "./roles.mjs";
+import { ASSIGNABLE_ROLES, canonicalizeRole, roleFromAgentName } from "./roles.mjs";
 import { readHerdrSnapshot, attachHerdrTeams } from "./herdr.mjs";
 import { findRolloutPaths, readCodexRollout, readCodexRolloutFull, sessionIdFromPath } from "./codex.mjs";
 import { readTranscript, redactString } from "./transcript.mjs";
@@ -719,8 +719,15 @@ const server = http.createServer(async (req, res) => {
         const view = mergeTeamView(team);
         sCopy.office = view.office;
         sCopy.heatmap = view.heatmap;
-      } else if (s.meta.roleOverride) {
-        sCopy.office = applyAssignedRole(s.office, s.meta.roleOverride);
+      } else {
+        const override = s.meta.roleOverride;
+        const hod = s.meta.team?.hodRole;
+        const named = roleFromAgentName(s.meta.team?.herdrName);
+        if (override || hod || named) {
+          sCopy.office = applyAssignedRole(s.office, override || hod || named, {
+            source: override ? "user" : hod ? "hod" : "name",
+          });
+        }
       }
       return sendJson(res, 200, { session: sCopy });
     }

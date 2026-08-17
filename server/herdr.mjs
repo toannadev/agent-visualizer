@@ -3,6 +3,7 @@
 
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { parseHodRelation, parseHodRole, roleFromAgentName } from "./roles.mjs";
 
 const HERDR_BIN = process.env.HERDR_BIN || "herdr";
 const SNAPSHOT_TTL_MS = 3_000;
@@ -97,8 +98,10 @@ function normalizeAgent(raw) {
     workspaceNumber: raw.workspace_number ?? raw.workspaceNumber ?? null,
     cwd,
     sessionId,
+    terminalTitle: String(raw.terminal_title_stripped || raw.terminal_title || "").trim(),
     status: raw.agent_status || raw.status || "",
-    hodRole: extractHodRole(raw),
+    hodRole: parseHodRole(tokenMap(raw).hod_role),
+    hodRelation: parseHodRelation(tokenMap(raw).hod_relation),
     hodRun: tokenStr(raw, "hod_run"),
     hodTask: tokenStr(raw, "hod_task"),
     hodParent: tokenStr(raw, "hod_parent"),
@@ -114,28 +117,32 @@ function tokenStr(raw, name) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
 
-function extractHodRole(raw) {
-  const fromToken = tokenMap(raw).hod_role || tokenMap(raw).role;
-  if (fromToken) return String(fromToken).trim().toLowerCase();
-  const blob = `${raw.name || ""} ${raw.terminal_title_stripped || raw.terminal_title || ""}`;
-  if (/\b(advisor|consult)\b/i.test(blob)) return "advisor";
-  if (/\b(reviewer|review)\b/i.test(blob)) return "reviewer";
-  if (/\b(tester|qa)\b/i.test(blob)) return "tester";
-  if (/\b(controller|lead)\b/i.test(blob)) return "controller";
-  if (/\b(worker|impl|coder)\b/i.test(blob)) return "worker";
-  return null;
-}
-
 function familyId(agent, byPane) {
-  // Controller panes are often untagged. A child may have hod_run while the
-  // parent does not — still one team. Share run/tab across the parent tree
-  // and anyone on the same tab. Never fall back to workspace.
-  const members = familyMembers(agent, byPane);
+  // Only Herdr-spawned roles (worker-1, reviewer-1, …) and their controller
+  // share a team. A plain Grok pane on the same tab is a different session.
+  if (!isOrchestrationMember(agent, byPane)) {
+    return agent.paneId ? `pane:${agent.paneId}` : "";
+  }
+  const members = familyMembers(agent, byPane).filter((a) => isOrchestrationMember(a, byPane));
   const run = members.map((a) => a.hodRun).find(Boolean);
   if (run) return `run:${run}`;
-  const tab = members.map((a) => a.tabId).find(Boolean) || agent.tabId;
-  if (tab) return `tab:${tab}`;
+  const tab = agent.tabId || members.map((a) => a.tabId).find(Boolean);
+  if (tab) return `orch:${tab}`;
   return "";
+}
+
+function isOrchestrationMember(agent, byPane) {
+  if (agent.hodRole || agent.hodParent || agent.hodRun) return true;
+  if (roleFromAgentName(agent.name)) return true;
+  const tab = agent.tabId;
+  if (!tab || !byPane) return false;
+  const onTab = [...byPane.values()].filter((a) => a.tabId === tab);
+  const hasSpawn = onTab.some((a) => roleFromAgentName(a.name) || a.hodRole);
+  if (!hasSpawn) return false;
+  const untagged = onTab.filter((a) => !roleFromAgentName(a.name) && !a.hodRole);
+  if (untagged.length === 1) return untagged[0].paneId === agent.paneId;
+  // Several untagged panes on the tab: only the Claude controller joins.
+  return agent.kind === "claude" && untagged.filter((a) => a.kind === "claude").length === 1;
 }
 
 function familyMembers(agent, byPane) {
@@ -183,7 +190,10 @@ export function attachHerdrTeams(sessions, agents, { live = true } = {}) {
       herdrName: agent.name,
       herdrKind: agent.kind,
       herdrStatus: agent.status,
+      herdrSessionId: agent.sessionId || null,
+      terminalTitle: agent.terminalTitle || "",
       hodRole: agent.hodRole || null,
+      hodRelation: agent.hodRelation || null,
       hodRun: agent.hodRun || null,
       hodTask: agent.hodTask || null,
       hodParent: agent.hodParent || null,
@@ -199,25 +209,22 @@ export function attachHerdrTeams(sessions, agents, { live = true } = {}) {
   };
 
   for (const s of list) {
-    const agent = agents.find((a) => a.sessionId && a.sessionId === s.meta.id);
+    const agent = agents.find((a) => a.sessionId && idsMatch(a.sessionId, s.meta.id));
     if (!agent) continue;
     bind(s, agent);
     used.add(agent);
   }
 
+  // Grok Herdr agents often have no session id. Bind by OSC/title, which
+  // matches that spawn's generated_title — never by shared cwd.
   for (const agent of agents) {
-    if (used.has(agent)) continue;
-    // Known session id already failed to match — do not steal another session by cwd.
-    if (agent.sessionId) continue;
-    const cwd = normCwd(agent.cwd);
-    if (!cwd) continue;
-    const cands = list
-      .filter((s) => !s.meta.team && kindMatches(s.meta.runtime, agent.kind) && normCwd(s.meta.cwd) === cwd)
-      .sort((a, b) => (b.meta.mtimeMs || 0) - (a.meta.mtimeMs || 0));
-    if (cands[0]) {
-      bind(cands[0], agent);
-      used.add(agent);
-    }
+    if (used.has(agent) || agent.sessionId) continue;
+    const title = titleKey(agent.terminalTitle);
+    if (!title) continue;
+    const hits = list.filter((s) => !s.meta.team && titlesMatch(s.meta.title, agent.terminalTitle));
+    if (hits.length !== 1) continue;
+    bind(hits[0], agent);
+    used.add(agent);
   }
 
   if (live) {
@@ -233,14 +240,30 @@ export function attachHerdrTeams(sessions, agents, { live = true } = {}) {
 }
 
 function stillOnLivePane(s, agents) {
-  if (agents.some((a) => a.sessionId && a.sessionId === s.meta.id)) return true;
-  const paneId = s.meta.team?.paneId;
-  if (!paneId) return false;
-  const occupant = agents.find((a) => a.paneId === paneId);
-  if (!occupant) return false;
-  // Pane reused by a different known session — drop the stale teammate.
-  if (occupant.sessionId && occupant.sessionId !== s.meta.id) return false;
-  return !occupant.sessionId;
+  if (agents.some((a) => a.sessionId && idsMatch(a.sessionId, s.meta.id))) return true;
+  const occupant = agents.find((a) => a.paneId && a.paneId === s.meta.team?.paneId);
+  if (!occupant || occupant.sessionId) return false;
+  return titlesMatch(s.meta.title, occupant.terminalTitle)
+    && occupant.name === s.meta.team?.herdrName;
+}
+
+function titleKey(value) {
+  return String(value || "")
+    .replace(/\s*[-–—]\s*grok\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function titlesMatch(sessionTitle, agentTitle) {
+  const a = titleKey(sessionTitle);
+  const b = titleKey(agentTitle);
+  return Boolean(a && b && a === b);
+}
+
+function idsMatch(a, b) {
+  if (!a || !b) return false;
+  return String(a).toLowerCase() === String(b).toLowerCase();
 }
 
 function teamLabel(agent, members = []) {
@@ -273,5 +296,7 @@ function normCwd(cwd) {
 
 function sameTeam(a, b) {
   if (!a || !b) return false;
-  return a.id === b.id && a.paneId === b.paneId && a.herdrName === b.herdrName && a.hodRole === b.hodRole;
+  return a.id === b.id && a.paneId === b.paneId && a.herdrName === b.herdrName
+    && a.hodRole === b.hodRole && a.hodRelation === b.hodRelation
+    && a.herdrSessionId === b.herdrSessionId;
 }

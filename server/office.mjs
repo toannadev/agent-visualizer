@@ -1,7 +1,7 @@
 // Office compiler — PURE (no IO). Collapse VisualEvent[] into people / tickets /
 // handoffs / artifacts. The dashboard renders this object; it does not re-parse events.
 
-import { resolveRole, roleLabel, parseRoleDirective, matchDirective, canonicalizeRole } from "./roles.mjs";
+import { resolveRole, roleLabel, parseRoleDirective, matchDirective, canonicalizeRole, roleFromAgentName } from "./roles.mjs";
 
 const LEAD = "lead";
 const USER = "user";
@@ -301,7 +301,7 @@ function blankPerson(id, kind) {
     kind,
     label: kind === "lead" ? "Lead" : shortId(id),
     roleHint: kind === "lead" ? "lead" : "unknown",
-    roleSource: kind === "lead" ? "lead" : "inferred",
+    roleSource: kind === "lead" ? "lead" : "unmapped",
     status: "idle",
     currentWork: "",
     ticketId: null,
@@ -360,7 +360,7 @@ function finalizeStatuses(people, { sawSessionEnd, openSubs }) {
   }
 }
 
-function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPerson, tickets }) {
+function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPerson }) {
   for (const p of people.values()) {
     const toolMap = toolsByPerson.get(p.id) || new Map();
     const belt = [...toolMap.entries()]
@@ -372,14 +372,10 @@ function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPe
     p.files = [...fileMap.values()].sort((a, b) => b.total - a.total);
     p.fileCount = p.files.length;
     p.eventIds = eventIdsByPerson.get(p.id) || [];
-    const ticket = tickets.find((t) => t.id === p.ticketId);
-    const title = ticket?.title || p.currentWork || "";
-    const resolved = resolveRole({ kind: p.kind, title, toolMap });
-    p.roleHint = p.kind === "lead"
-      ? "lead"
-      : (resolved.role === "unknown" ? "worker" : resolved.role);
+    const resolved = resolveRole({ kind: p.kind });
+    p.roleHint = resolved.role;
     p.roleSource = resolved.roleSource;
-    if (p.kind === "subagent") p.label = roleLabel(p.roleHint);
+    if (p.kind === "subagent" && p.roleHint !== "unknown") p.label = roleLabel(p.roleHint);
   }
 }
 
@@ -504,7 +500,7 @@ function deltaMs(a, b) {
 
 // Merge Herdr teammates into one floor: controller = Lead, others = staff.
 export function mergeTeamView(members = []) {
-  const live = members.filter((m) => m?.office && m?.meta);
+  const live = dedupeTeamMembers(members.filter((m) => m?.office && m?.meta));
   if (live.length < 2) {
     const only = live[0];
     return {
@@ -518,13 +514,49 @@ export function mergeTeamView(members = []) {
   };
 }
 
+/** One desk per live Herdr pane (or start-name). Keep the spawn's own session, not a newer chat. */
+function dedupeTeamMembers(members) {
+  const byKey = new Map();
+  for (const m of members) {
+    const pane = m.meta?.team?.paneId;
+    const name = String(m.meta?.team?.herdrName || "").trim().toLowerCase();
+    const rt = String(m.meta?.runtime || "");
+    const key = pane
+      ? `pane:${pane}`
+      : name
+        ? `name:${rt}:${name}`
+        : `id:${m.meta.id}`;
+    const prev = byKey.get(key);
+    if (!prev || preferSpawnSession(m, prev)) byKey.set(key, m);
+  }
+  return [...byKey.values()];
+}
+
+function preferSpawnSession(next, prev) {
+  const want = next.meta?.team?.herdrSessionId || prev.meta?.team?.herdrSessionId;
+  if (want) {
+    const nextHit = idsEqual(next.meta.id, want);
+    const prevHit = idsEqual(prev.meta.id, want);
+    if (nextHit !== prevHit) return nextHit;
+  }
+  return (next.meta.mtimeMs || 0) > (prev.meta.mtimeMs || 0);
+}
+
+function idsEqual(a, b) {
+  if (!a || !b) return false;
+  const x = String(a).toLowerCase();
+  const y = String(b).toLowerCase();
+  return x === y || x.endsWith(y) || y.endsWith(x);
+}
+
 function mergeTeamOffice(members) {
   const allDirectives = members.flatMap((m) => m.office?.directives || []);
   const leadMember = pickTeamLead(members, allDirectives);
   const workers = members.filter((m) => m.meta.id !== leadMember.meta.id);
   const src = leadMember.office || emptyOffice();
   const leadSrc = (src.people || []).find((p) => p.kind === "lead") || blankPerson(LEAD, "lead");
-  const ownSubs = (src.people || []).filter((p) => p.kind === "subagent");
+  // Herdr teammates are the floor. In-session Task subagents of the controller
+  // would otherwise appear as extra desks next to the real worker/reviewer.
 
   const lead = {
     ...leadSrc,
@@ -539,13 +571,13 @@ function mergeTeamOffice(members) {
   };
 
   const staff = workers.map((w) => personFromMember(w, allDirectives));
-  const people = [lead, ...ownSubs, ...staff];
+  const people = [lead, ...staff];
 
   const tickets = [...(src.tickets || [])];
   const handoffs = [...(src.handoffs || [])];
   for (const w of workers) {
     const pid = herdrPersonId(w);
-    const title = w.office.brief || w.office.outcome || w.office.people?.[0]?.currentWork || "assigned work";
+    const title = spawnTaskTitle(w);
     tickets.push({
       id: `herdr-t-${w.meta.id}`,
       title,
@@ -574,7 +606,7 @@ function mergeTeamOffice(members) {
     ...workers.map((w) => remapArtifacts(w.office.artifacts, herdrPersonId(w))),
   ]);
 
-  const delegated = [...ownSubs, ...staff];
+  const delegated = [...staff];
   lead.assignments = delegated.map((p) => {
     const ticket = tickets.find((t) => t.toId === p.id);
     return {
@@ -609,21 +641,53 @@ function mergeTeamOffice(members) {
 function assignedRole(member, directives = []) {
   const override = canonicalizeRole(member.meta?.roleOverride);
   if (override) return { role: override, source: "user" };
-  const hod = canonicalizeRole(member.meta?.team?.hodRole || member.meta?.team?.role);
+  const hod = canonicalizeRole(member.meta?.team?.hodRole);
   if (hod) return { role: hod, source: "hod" };
   const directive = matchDirective(directives, {
     runtime: member.meta?.runtime,
     herdrName: member.meta?.team?.herdrName,
   });
   if (directive) return { role: directive.role, source: "user" };
+  const named = roleFromAgentName(member.meta?.team?.herdrName);
+  if (named) return { role: named, source: "name" };
+  return null;
+}
+
+const CHILD_ROLES = new Set(["worker", "impl", "review", "advisor", "tester"]);
+
+function childRoleOf(member) {
+  const hod = canonicalizeRole(member.meta?.team?.hodRole);
+  if (hod && CHILD_ROLES.has(hod)) return hod;
+  const named = roleFromAgentName(member.meta?.team?.herdrName);
+  if (named && CHILD_ROLES.has(named)) return named;
   return null;
 }
 
 function pickTeamLead(members, directives = []) {
+  const byHod = members.find((m) => {
+    const hod = String(m.meta?.team?.hodRole || "").toLowerCase();
+    return hod === "controller" || hod === "lead";
+  });
+  if (byHod) return byHod;
+  const byName = members.find((m) => roleFromAgentName(m.meta?.team?.herdrName) === "lead");
+  if (byName) return byName;
+  const byParent = members.find((m) => {
+    const pane = m.meta?.team?.paneId;
+    return pane && members.some((o) => o !== m && o.meta?.team?.hodParent === pane);
+  });
+  if (byParent) return byParent;
+  // Untagged controller pane (Desktop 0.1.7): Claude with no start-name
+  // sitting next to worker-1 / reviewer-1. Do not fall back to "started first".
+  const children = members.filter((m) => childRoleOf(m));
+  const rest = members.filter((m) => !childRoleOf(m));
+  if (children.length && rest.length === 1) return rest[0];
+  if (children.length && rest.length > 1) {
+    const unnamed = rest.filter((m) => !String(m.meta?.team?.herdrName || "").trim());
+    if (unnamed.length === 1) return unnamed[0];
+    return [...rest].sort((a, b) => String(a.meta.startedAt || "").localeCompare(String(b.meta.startedAt || "")))[0];
+  }
   const byAssign = members.find((m) => assignedRole(m, directives)?.role === "lead");
   if (byAssign) return byAssign;
-  const typer = members.find((m) => (m.office?.directives || []).length);
-  if (typer) return typer;
   return [...members].sort((a, b) => String(a.meta.startedAt || "").localeCompare(String(b.meta.startedAt || "")))[0];
 }
 
@@ -631,28 +695,20 @@ function personFromMember(member, directives = []) {
   const src = (member.office.people || []).find((p) => p.kind === "lead") || blankPerson(LEAD, "lead");
   const runtime = member.meta.runtime || "other";
   const assigned = assignedRole(member, directives);
-  const toolMap = new Map((src.toolBelt || src.tools || []).map((t) => [t.name, t.count]));
   const spawn = String(member.meta.team?.herdrName || "").trim();
-  const resolved = resolveRole({
-    kind: "subagent",
+  const resolved = assigned || resolveRole({
     hodRole: member.meta.team?.hodRole,
-    title: member.office.brief || member.office.outcome || src.currentWork,
+    override: member.meta?.roleOverride,
     name: spawn,
-    toolMap,
   });
-  if (assigned) {
-    resolved.role = assigned.role;
-    resolved.roleSource = assigned.source;
-  }
-  if (resolved.role === "lead" || resolved.role === "unknown") resolved.role = "worker";
   return {
     ...src,
     id: herdrPersonId(member),
     kind: "subagent",
-    label: spawn || roleLabel(resolved.role),
+    label: spawn || (resolved.role !== "unknown" ? roleLabel(resolved.role) : shortId(member.meta.id)),
     roleHint: resolved.role,
-    roleSource: resolved.roleSource,
-    currentWork: member.office.outcome || src.currentWork || member.office.brief || "",
+    roleSource: resolved.source || resolved.roleSource,
+    currentWork: spawnWorkText(member),
     ticketId: `herdr-t-${member.meta.id}`,
     sessionId: member.meta.id,
     runtime,
@@ -660,7 +716,24 @@ function personFromMember(member, directives = []) {
   };
 }
 
+function spawnTaskTitle(member) {
+  return oneLine(member.office?.brief || member.meta?.team?.hodTask || "", 140)
+    || oneLine(member.office?.people?.[0]?.currentWork || "", 140)
+    || "assigned work";
+}
+
+function spawnWorkText(member) {
+  const outcome = oneLine(member.office?.outcome || "", 140);
+  if (outcome) return outcome;
+  const own = (member.office?.people || []).find((p) => p.kind === "lead");
+  return oneLine(own?.currentWork || member.office?.brief || "", 140);
+}
+
 function herdrPersonId(member) {
+  const spawn = String(member.meta?.team?.herdrName || "").trim().toLowerCase();
+  const pane = member.meta?.team?.paneId;
+  if (pane) return `herdr:pane:${pane}`;
+  if (spawn) return `herdr:${member.meta.runtime}:${spawn}`;
   return `herdr:${member.meta.runtime}:${member.meta.id}`;
 }
 

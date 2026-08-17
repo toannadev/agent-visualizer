@@ -1,14 +1,35 @@
-// Canonical office roles. Herdr hod_role maps in; title/tool heuristics fill gaps.
+// Role comes from an explicit assignment, never from ticket/title text.
+// Sources, in order:
+//   1. User picker / chat directive ("@reviewer grok …")
+//   2. HOD 0.1.18 pane token hod_role
+//   3. Herdr agent name from `herdr agent start <name>` (Desktop 0.1.7)
+
+export const HOD_ROLE_VALUES = Object.freeze([
+  "controller",
+  "worker",
+  "advisor",
+  "reviewer",
+  "tester",
+]);
+
+export const HOD_RELATION_VALUES = Object.freeze(["delegate", "consult", "verify"]);
+
+export const HOD_ROLE_RELATIONS = Object.freeze({
+  controller: null,
+  worker: "delegate",
+  advisor: "consult",
+  reviewer: "verify",
+  tester: "verify",
+});
 
 const ROLES = {
   lead: { id: "lead", label: "Lead", family: "lead", badge: "Lead" },
   worker: { id: "worker", label: "Worker", family: "work", badge: "Worker" },
-  explore: { id: "explore", label: "Explore", family: "work", badge: "Explore" },
-  implement: { id: "implement", label: "Coder", family: "work", badge: "Coder" },
-  review: { id: "review", label: "Review", family: "verify", badge: "Review" },
+  impl: { id: "impl", label: "Impl", family: "work", badge: "Impl" },
+  review: { id: "review", label: "Reviewer", family: "verify", badge: "Reviewer" },
   advisor: { id: "advisor", label: "Advisor", family: "consult", badge: "Advisor" },
   tester: { id: "tester", label: "Tester", family: "verify", badge: "Tester" },
-  unknown: { id: "unknown", label: "Agent", family: "work", badge: "" },
+  unknown: { id: "unknown", label: "Unmapped", family: "work", badge: "" },
 };
 
 const HOD_TO_ROLE = {
@@ -19,22 +40,21 @@ const HOD_TO_ROLE = {
   tester: "tester",
 };
 
-const ADVISOR_RE = /\b(advisor|advis[eo]r|cố vấn|co van|consult|thiết kế|thiet ke|architect)\b/i;
-const REVIEW_RE = /\b(review|reviewer|diff|check|audit|inspect|soát|soat)\b/i;
-const TESTER_RE = /\b(test|tester|qa|verify|e2e|spec)\b/i;
-const EXPLORE_RE = /\b(explore|search|find|look|where|locate|scan|scout)\b/i;
-const IMPLEMENT_RE = /\b(implement|patch|fix|write|coder|build|sửa|sua)\b/i;
+// Whole name segments from `herdr agent start <name>` or settings.<role>.json.
+const NAME_TO_ROLE = {
+  controller: "lead",
+  lead: "lead",
+  impl: "impl",
+  implementer: "impl",
+  reviewer: "review",
+  worker: "worker",
+  advisor: "advisor",
+  tester: "tester",
+};
 
-
-function roleInfo(id) {
-  return ROLES[id] || ROLES.unknown;
-}
-
-export function roleLabel(id) {
-  return roleInfo(id).label;
-}
-
-export const ASSIGNABLE_ROLES = ["lead", "worker", "explore", "implement", "review", "advisor", "tester"];
+export const ASSIGNABLE_ROLES = Object.freeze([
+  "lead", "worker", "impl", "review", "advisor", "tester",
+]);
 
 const WHO_ALIAS = {
   gpt: "codex",
@@ -46,27 +66,81 @@ const WHO_ALIAS = {
   gemini: "other",
 };
 
-function normalizeWho(who) {
-  const key = String(who || "").toLowerCase();
-  return WHO_ALIAS[key] || key;
+function roleInfo(id) {
+  return ROLES[id] || ROLES.unknown;
+}
+
+export function roleLabel(id) {
+  return roleInfo(id).label;
+}
+
+export function parseHodRole(raw) {
+  if (typeof raw !== "string") return null;
+  const key = raw.trim().toLowerCase();
+  return HOD_ROLE_VALUES.includes(key) ? key : null;
+}
+
+export function parseHodRelation(raw) {
+  if (typeof raw !== "string") return null;
+  const key = raw.trim().toLowerCase();
+  return HOD_RELATION_VALUES.includes(key) ? key : null;
 }
 
 export function canonicalizeRole(raw) {
   if (!raw) return null;
   const key = String(raw).trim().toLowerCase();
-  if (key === "controller") return "lead";
-  if (key === "reviewer") return "review";
-  if (key === "coder") return "implement";
+  if (key === "unmapped") return "unknown";
+  if (HOD_TO_ROLE[key]) return HOD_TO_ROLE[key];
   if (ASSIGNABLE_ROLES.includes(key) || key === "unknown") return key;
-  return normalizeHodRole(key);
+  return NAME_TO_ROLE[key] || null;
 }
 
-const ROLE_WORD = "worker|advisor|reviewer|review|tester|explore|coder|implement|lead";
+/** Role the user chose when they started the agent (`herdr agent start impl`). */
+export function roleFromAgentName(name) {
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim().toLowerCase();
+  if (!trimmed) return null;
+  if (NAME_TO_ROLE[trimmed]) return NAME_TO_ROLE[trimmed];
+  const parts = trimmed.split(/[-_]+/).filter(Boolean);
+  for (const part of parts) {
+    if (NAME_TO_ROLE[part]) return NAME_TO_ROLE[part];
+  }
+  return null;
+}
+
+/** Role from `--settings .claude/settings.impl.json` if the start argv is visible. */
+export function roleFromSettingsPath(path) {
+  if (typeof path !== "string") return null;
+  const m = path.trim().toLowerCase().match(/settings\.([a-z0-9_-]+)\.json$/);
+  return m ? canonicalizeRole(m[1]) : null;
+}
+
+export function resolveRole({ kind, hodRole, override, name, settingsPath } = {}) {
+  const user = canonicalizeRole(override);
+  if (user) return { role: user, roleSource: "user" };
+  const hod = canonicalizeRole(hodRole);
+  if (hod) return { role: hod, roleSource: "hod" };
+  const fromSettings = roleFromSettingsPath(settingsPath);
+  if (fromSettings) return { role: fromSettings, roleSource: "name" };
+  const fromName = roleFromAgentName(name);
+  if (fromName) return { role: fromName, roleSource: "name" };
+  if (kind === "lead") return { role: "lead", roleSource: "lead" };
+  return { role: "unknown", roleSource: "unmapped" };
+}
+
+function normalizeWho(who) {
+  const key = String(who || "").toLowerCase();
+  return WHO_ALIAS[key] || key;
+}
+
+const ROLE_WORD = "worker|advisor|reviewer|review|tester|lead|controller|impl|implementer";
 const SLASH_ALIAS = {
   reviewer: "review",
   review: "review",
-  coder: "implement",
-  implement: "implement",
+  controller: "lead",
+  lead: "lead",
+  impl: "impl",
+  implementer: "impl",
 };
 
 const DIRECTIVE_PATTERNS = [
@@ -92,7 +166,7 @@ function packDirective(alias, who, task) {
   };
 }
 
-/** Parse a user role assignment. Prefer "@worker grok …" or "vai trò worker …" — not "/worker" inside Claude Code. */
+/** Parse an explicit user role assignment. Not used to guess roles from ordinary prompts. */
 export function parseRoleDirective(text) {
   const raw = String(text || "").trim();
   if (!raw) return null;
@@ -120,35 +194,3 @@ export function matchDirective(directives, { runtime, herdrName } = {}) {
     return false;
   }) || null;
 }
-
-function normalizeHodRole(raw) {
-  if (!raw) return null;
-  const key = String(raw).trim().toLowerCase();
-  return HOD_TO_ROLE[key] || (ROLES[key] ? key : null);
-}
-
-function inferRoleFromText(...parts) {
-  const text = parts.filter(Boolean).join(" ");
-  if (!text) return "unknown";
-  if (ADVISOR_RE.test(text)) return "advisor";
-  if (TESTER_RE.test(text)) return "tester";
-  if (REVIEW_RE.test(text)) return "review";
-  if (EXPLORE_RE.test(text)) return "explore";
-  if (IMPLEMENT_RE.test(text)) return "implement";
-  return "unknown";
-}
-
-export function resolveRole({ kind, hodRole, title, name } = {}) {
-  if (kind === "lead") {
-    return { role: "lead", roleSource: hodRole ? "hod" : "lead" };
-  }
-  const hod = normalizeHodRole(hodRole);
-  if (hod) return { role: hod, roleSource: "hod" };
-  const fromText = inferRoleFromText(title, name);
-  if (fromText !== "unknown") {
-    return { role: fromText, roleSource: "inferred" };
-  }
-  return { role: "unknown", roleSource: "inferred" };
-}
-
-
