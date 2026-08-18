@@ -2,6 +2,7 @@
 // handoffs / artifacts. The dashboard renders this object; it does not re-parse events.
 
 import { resolveRole, roleLabel, parseRoleDirective, matchDirective, canonicalizeRole, roleFromAgentName } from "./roles.mjs";
+import { parseHerdrAgentInvocation, parseHerdrCliJson } from "./herdr.mjs";
 
 const LEAD = "lead";
 const USER = "user";
@@ -37,6 +38,7 @@ export function buildOffice(events = []) {
 
   let mode = "sequential";
   const openSubs = [];
+  const pendingHerdr = new Map();
   let current = LEAD;
   let brief = "";
   let outcome = "";
@@ -111,6 +113,24 @@ export function buildOffice(events = []) {
       handoffs.push(makeHandoff("brief", USER, LEAD, ticket.id, title, ev.ts));
       current = LEAD;
       addEvent(LEAD, ev);
+      continue;
+    }
+
+    if (ev.kind === "tool_call") {
+      const inv = parseHerdrAgentInvocation(ev.detail || ev.label);
+      if (inv) {
+        pendingHerdr.set(ev.toolUseId || ev.id, inv);
+        addEvent(LEAD, ev);
+        bumpTool(LEAD, "herdr");
+        continue;
+      }
+    }
+
+    if ((ev.kind === "tool_output" || ev.kind === "tool_error") && pendingHerdr.has(ev.toolUseId)) {
+      applyHerdrResult(ev, {
+        people, tickets, handoffs, openTicket, openSubs, pendingHerdr,
+        addEvent, bumpTool,
+      });
       continue;
     }
 
@@ -246,6 +266,98 @@ function attribute(ev, { mode, current, people }) {
   return mode === "sequential" ? current : LEAD;
 }
 
+function herdrDeskId(name) {
+  return `herdr:${String(name || "").trim().toLowerCase()}`;
+}
+
+function applyHerdrResult(ev, ctx) {
+  const { people, tickets, handoffs, openTicket, openSubs, pendingHerdr, addEvent, bumpTool } = ctx;
+  const inv = pendingHerdr.get(ev.toolUseId) || parseHerdrAgentInvocation(ev.detail);
+  const parsed = parseHerdrCliJson(ev.detail);
+  const failed = ev.kind === "tool_error" || Boolean(parsed?.error);
+  const agent = parsed?.result?.agent || parsed?.agent || {};
+  const name = String(agent.name || inv?.name || "").trim();
+  pendingHerdr.delete(ev.toolUseId);
+  if (!name || name.startsWith("-")) {
+    addEvent(LEAD, ev);
+    return;
+  }
+
+  const action = (() => {
+    const id = String(parsed?.id || parsed?.result?.type || parsed?.type || "");
+    if (id.includes("agent:start") || id === "agent_started") return "start";
+    if (id.includes("agent:prompt") || id === "agent_prompted") return "prompt";
+    return inv?.action || "";
+  })();
+
+  if (action === "start" && failed) {
+    addEvent(LEAD, ev);
+    return;
+  }
+  if (action !== "start" && action !== "prompt") {
+    addEvent(LEAD, ev);
+    return;
+  }
+
+  const id = herdrDeskId(name);
+  const person = ensurePerson(people, id, "subagent");
+  person.herdrName = name;
+  const kind = inv?.kind || (typeof agent.agent === "string" ? agent.agent : "") || agent.kind || "";
+  if (kind && kind !== "id") person.runtime = String(kind).toLowerCase();
+  addEvent(LEAD, ev);
+  addEvent(id, ev);
+
+  if (action === "start") {
+    if (!openSubs.includes(id)) openSubs.push(id);
+    person.status = "doing";
+    if (!person.currentWork) person.currentWork = `${name} started`;
+    if (people.get(LEAD).status !== "blocked") people.get(LEAD).status = "doing";
+    return;
+  }
+
+  const title = oneLine(inv?.text || agent.terminal_title_stripped || `prompt ${name}`, 80);
+  const ticket = {
+    id: `t-${id}-${tickets.length}`,
+    title,
+    full: inv?.text || title,
+    fromId: LEAD,
+    toId: id,
+    status: "doing",
+    startTs: ev.ts || "",
+    endTs: null,
+    durationMs: null,
+  };
+  tickets.push(ticket);
+  openTicket.set(id, ticket);
+  person.ticketId = ticket.id;
+  person.currentWork = title;
+  if (!openSubs.includes(id)) openSubs.push(id);
+  handoffs.push(makeHandoff("delegate", LEAD, id, ticket.id, title, ev.ts));
+
+  const st = String(agent.agent_status || agent.status || "").toLowerCase();
+  if (failed || st === "blocked") {
+    closeTicket(ticket, ev.ts, "failed");
+    openTicket.delete(id);
+    person.status = "blocked";
+    person.errorCount += 1;
+    handoffs.push(makeHandoff("return", id, LEAD, ticket.id, oneLine(ev.detail || "failed", 140), ev.ts));
+    const idx = openSubs.lastIndexOf(id);
+    if (idx >= 0) openSubs.splice(idx, 1);
+    return;
+  }
+  if (st === "idle" || st === "done") {
+    closeTicket(ticket, ev.ts, "done");
+    openTicket.delete(id);
+    person.status = "done";
+    person.exited = st === "idle";
+    handoffs.push(makeHandoff("return", id, LEAD, ticket.id, oneLine(title, 140), ev.ts));
+    const idx = openSubs.lastIndexOf(id);
+    if (idx >= 0) openSubs.splice(idx, 1);
+    return;
+  }
+  person.status = "doing";
+}
+
 function isSubStart(ev) {
   if (ev.kind === "subagent_start") return true;
   return ev.kind === "tool_call" && SUB_TOOLS.test(ev.toolName || "");
@@ -335,6 +447,7 @@ function blankPerson(id, kind) {
     runtime: "",
     herdrName: "",
     assignments: [],
+    exited: false,
   };
 }
 
@@ -401,10 +514,13 @@ function applyRolesAndBelts(people, { toolsByPerson, filesByPerson, eventIdsByPe
         startTs: t.startTs || "",
         endTs: t.endTs || null,
       }));
-    const resolved = resolveRole({ kind: p.kind });
+    const resolved = resolveRole({ kind: p.kind, name: p.herdrName, hodRole: p.hodRole });
     p.roleHint = resolved.role;
     p.roleSource = resolved.roleSource;
-    if (p.kind === "subagent" && p.roleHint !== "unknown") p.label = roleLabel(p.roleHint);
+    if (p.kind === "subagent") {
+      if (p.herdrName) p.label = p.herdrName;
+      else if (p.roleHint !== "unknown") p.label = roleLabel(p.roleHint);
+    }
   }
 }
 
@@ -626,6 +742,7 @@ function mergeTeamOffice(members) {
     sessionId: leadMember.meta.id,
     runtime: leadMember.meta.runtime,
     herdrName: leadMember.meta.team?.herdrName || "",
+    exited: Boolean(leadMember.meta.team?.exited),
   };
 
   const staff = workers.map((w) => personFromMember(w, allDirectives));
@@ -782,6 +899,8 @@ function personFromMember(member, directives = []) {
     sessionId: member.meta.id,
     runtime,
     herdrName: spawn,
+    exited: Boolean(member.meta.team?.exited),
+    status: member.meta.team?.exited && src.status !== "blocked" ? "done" : src.status,
   };
 }
 

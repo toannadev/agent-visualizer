@@ -117,18 +117,38 @@ function tokenStr(raw, name) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
 
-function familyId(agent, byPane) {
+function isFamilyId(id) {
+  const s = String(id || "");
+  return s.startsWith("orch:") || s.startsWith("run:");
+}
+
+function familyId(agent, byPane, sessions = []) {
   // Only Herdr-spawned roles (worker-1, reviewer-1, …) and their controller
   // share a team. A plain Grok pane on the same tab is a different session.
-  if (!isOrchestrationMember(agent, byPane)) {
+  const historical = historicalFamilyId(agent, sessions);
+  if (!isOrchestrationMember(agent, byPane) && !historical) {
     return agent.paneId ? `pane:${agent.paneId}` : "";
   }
+  if (historical) return historical;
   const members = familyMembers(agent, byPane).filter((a) => isOrchestrationMember(a, byPane));
   const run = members.map((a) => a.hodRun).find(Boolean);
   if (run) return `run:${run}`;
   const tab = agent.tabId || members.map((a) => a.tabId).find(Boolean);
   if (tab) return `orch:${tab}`;
   return "";
+}
+
+function historicalFamilyId(agent, sessions = []) {
+  let fallback = "";
+  for (const s of sessions) {
+    const team = s?.meta?.team;
+    if (!isFamilyId(team?.id)) continue;
+    if (agent.sessionId && idsMatch(agent.sessionId, s.meta.id)) return team.id;
+    if (agent.paneId && team.paneId && agent.paneId === team.paneId) return team.id;
+    if (agent.tabId && team.tabId && agent.tabId === team.tabId) fallback = fallback || team.id;
+    if (agent.name && team.herdrName && agent.name === team.herdrName) fallback = fallback || team.id;
+  }
+  return fallback;
 }
 
 function isOrchestrationMember(agent, byPane) {
@@ -181,12 +201,19 @@ export function attachHerdrTeams(sessions, agents, { live = true } = {}) {
     if (a.paneId) byPane.set(a.paneId, a);
   }
 
+  const note = (id) => {
+    if (id && !changed.includes(id)) changed.push(id);
+  };
+
+  applyHistoricalTeams(list, collectHerdrHistory(list), note);
+
   const bind = (s, agent) => {
     const next = {
-      id: familyId(agent, byPane),
+      id: familyId(agent, byPane, list),
       label: teamLabel(agent, familyMembers(agent, byPane)),
       cwd: agent.cwd || "",
       paneId: agent.paneId,
+      tabId: agent.tabId || "",
       herdrName: agent.name,
       herdrKind: agent.kind,
       herdrStatus: agent.status,
@@ -200,12 +227,9 @@ export function attachHerdrTeams(sessions, agents, { live = true } = {}) {
       role: agent.hodRole || null,
       workspaceLabel: agent.workspaceLabel || "",
       tabNumber: agent.tabNumber ?? null,
+      exited: false,
     };
-    if (!next.id) return;
-    const prev = s.meta.team;
-    if (sameTeam(prev, next)) return;
-    s.meta.team = next;
-    changed.push(s.meta.id);
+    applyTeam(s, next, note);
   };
 
   for (const s of list) {
@@ -221,7 +245,10 @@ export function attachHerdrTeams(sessions, agents, { live = true } = {}) {
     if (used.has(agent) || agent.sessionId) continue;
     const title = titleKey(agent.terminalTitle);
     if (!title) continue;
-    const hits = list.filter((s) => !s.meta.team && titlesMatch(s.meta.title, agent.terminalTitle));
+    const hits = list.filter((s) => {
+      if (s.meta.team && !s.meta.team.exited && s.meta.team.herdrName !== agent.name) return false;
+      return titlesMatch(s.meta.title, agent.terminalTitle);
+    });
     if (hits.length !== 1) continue;
     bind(hits[0], agent);
     used.add(agent);
@@ -230,13 +257,282 @@ export function attachHerdrTeams(sessions, agents, { live = true } = {}) {
   if (live) {
     for (const s of list) {
       if (!s.meta.team) continue;
-      if (stillOnLivePane(s, agents)) continue;
-      delete s.meta.team;
-      changed.push(s.meta.id);
+      if (stillOnLivePane(s, agents)) {
+        if (s.meta.team.exited) {
+          s.meta.team = { ...s.meta.team, exited: false };
+          note(s.meta.id);
+        }
+        continue;
+      }
+      if (replacedByDifferentLiveSession(s, agents)) {
+        delete s.meta.team;
+        note(s.meta.id);
+        continue;
+      }
+      // Agent left the pane: keep the desk in the historical session.
+      if (!s.meta.team.exited) {
+        s.meta.team = { ...s.meta.team, exited: true, herdrStatus: "exited" };
+        note(s.meta.id);
+      }
     }
   }
 
   return changed;
+}
+
+function applyTeam(s, next, note) {
+  if (!s?.meta || !next?.id) return;
+  const prev = s.meta.team;
+  if (isFamilyId(prev?.id) && !isFamilyId(next.id)) {
+    next = { ...next, id: prev.id, label: prev.label || next.label, tabId: next.tabId || prev.tabId };
+  }
+  if (isFamilyId(prev?.id) && isFamilyId(next.id) && prev.id !== next.id) {
+    const prevTab = prev.id.startsWith("orch:") && prev.id.includes(":");
+    const nextIsSessionFallback = next.id.startsWith("orch:") && /[0-9a-f]{8}-[0-9a-f]{4}-/i.test(next.id);
+    if (prevTab && nextIsSessionFallback) {
+      next = { ...next, id: prev.id, label: prev.label || next.label, tabId: next.tabId || prev.tabId };
+    }
+  }
+  if (sameTeam(prev, next) && Boolean(prev.exited) === Boolean(next.exited)) return;
+  s.meta.team = next;
+  note(s.meta.id);
+}
+
+function applyHistoricalTeams(sessions, history, note) {
+  if (!history.length) return;
+  const byId = new Map(sessions.map((s) => [s.meta.id, s]));
+  for (const group of history) {
+    const lead = byId.get(group.controllerId);
+    if (lead && !roleFromAgentName(lead.meta.team?.herdrName)) {
+      applyTeam(lead, {
+        id: group.familyId,
+        label: group.label,
+        cwd: lead.meta.cwd || group.cwd || "",
+        paneId: lead.meta.team?.paneId || "",
+        tabId: group.tabId || "",
+        herdrName: lead.meta.team?.herdrName || "",
+        herdrKind: lead.meta.runtime || "",
+        herdrStatus: lead.meta.team?.herdrStatus || "idle",
+        herdrSessionId: lead.meta.id,
+        terminalTitle: "",
+        hodRole: lead.meta.team?.hodRole || null,
+        hodRelation: lead.meta.team?.hodRelation || null,
+        hodRun: lead.meta.team?.hodRun || null,
+        hodTask: lead.meta.team?.hodTask || null,
+        hodParent: lead.meta.team?.hodParent || null,
+        role: lead.meta.team?.role || null,
+        workspaceLabel: lead.meta.team?.workspaceLabel || path.basename(String(lead.meta.cwd || "").replace(/\/+$/, "")),
+        tabNumber: lead.meta.team?.tabNumber ?? null,
+        exited: false,
+      }, note);
+    }
+    for (const spawn of group.spawns) {
+      const hit = matchHistoricalSpawn(sessions, spawn, group.controllerId);
+      if (!hit) continue;
+      applyTeam(hit, {
+        id: group.familyId,
+        label: group.label,
+        cwd: spawn.cwd || hit.meta.cwd || "",
+        paneId: spawn.paneId || "",
+        tabId: spawn.tabId || group.tabId || "",
+        herdrName: spawn.name,
+        herdrKind: spawn.kind || hit.meta.runtime || "",
+        herdrStatus: spawn.status || "exited",
+        herdrSessionId: spawn.sessionId || hit.meta.id,
+        terminalTitle: spawn.title || hit.meta.title || "",
+        hodRole: null,
+        hodRelation: null,
+        hodRun: null,
+        hodTask: null,
+        hodParent: null,
+        role: null,
+        workspaceLabel: path.basename(String(hit.meta.cwd || spawn.cwd || "").replace(/\/+$/, "")),
+        tabNumber: null,
+        exited: true,
+      }, note);
+    }
+  }
+}
+
+function matchHistoricalSpawn(sessions, spawn, controllerId) {
+  if (spawn.sessionId) {
+    const bySid = sessions.find((s) => idsMatch(s.meta.id, spawn.sessionId));
+    if (bySid) return bySid;
+  }
+  const title = spawn.title;
+  if (!title) return null;
+  const hits = sessions.filter((s) => {
+    if (s.meta.id === controllerId) return false;
+    if (s.meta.team?.herdrName && spawn.name && s.meta.team.herdrName !== spawn.name && !s.meta.team.exited) {
+      return false;
+    }
+    return titlesMatch(s.meta.title, title);
+  });
+  return hits.length === 1 ? hits[0] : null;
+}
+
+export function collectHerdrHistory(sessions) {
+  const groups = [];
+  for (const s of sessions || []) {
+    const spawns = herdrSpawnsFromEvents(s?.events || []);
+    if (!spawns.length) continue;
+    const tabId = spawns.map((x) => x.tabId).find(Boolean) || "";
+    const familyId = tabId ? `orch:${tabId}` : `orch:${s.meta.id}`;
+    const cwd = s.meta?.cwd || spawns.map((x) => x.cwd).find(Boolean) || "";
+    const ws = path.basename(String(cwd).replace(/\/+$/, ""));
+    const label = [ws, tabId ? `tab ${tabId}` : ""].filter(Boolean).join(" · ") || "herdr";
+    groups.push({
+      controllerId: s.meta.id,
+      familyId,
+      tabId,
+      cwd,
+      label,
+      spawns,
+    });
+  }
+  return groups;
+}
+
+function herdrSpawnsFromEvents(events) {
+  const byName = new Map();
+  const pending = new Map();
+  for (const ev of events || []) {
+    if (ev?.kind === "tool_call") {
+      const inv = parseHerdrAgentInvocation(ev.detail || ev.label);
+      if (inv) pending.set(ev.toolUseId || ev.id, inv);
+      continue;
+    }
+    if (ev?.kind !== "tool_output" && ev?.kind !== "tool_error") continue;
+    // Only a matching `herdr agent start/prompt` call counts. Copied JSON in
+    // a python/cat tool result must not invent a historical teammate.
+    const inv = pending.get(ev.toolUseId);
+    if (!inv) continue;
+    const parsed = parseHerdrCliJson(ev.detail);
+    const failed = ev.kind === "tool_error" || Boolean(parsed?.error);
+    const agent = parsed?.result?.agent || parsed?.agent || {};
+    const name = String(agent.name || inv.name || "").trim();
+    if (!name || name.startsWith("-")) continue;
+    const action = herdrActionOf(parsed, inv) || inv.action;
+    if (action === "start" && failed) continue;
+    if (action !== "start" && action !== "prompt") continue;
+    const prev = byName.get(name) || {
+      name,
+      paneId: "",
+      tabId: "",
+      kind: "",
+      title: "",
+      cwd: "",
+      sessionId: null,
+      status: "",
+    };
+    if (agent.pane_id || agent.paneId) prev.paneId = agent.pane_id || agent.paneId;
+    if (agent.tab_id || agent.tabId) prev.tabId = agent.tab_id || agent.tabId;
+    const kind = agent.agent || agent.kind;
+    if (typeof kind === "string" && kind && kind !== "id") prev.kind = kind;
+    const title = agent.terminal_title_stripped || agent.terminal_title || agent.terminalTitle;
+    if (title && !/^[-–—\s]*grok\s*$/i.test(String(title).replace(/[⠦⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "").trim())) {
+      prev.title = title;
+    }
+    if (agent.cwd) prev.cwd = agent.cwd;
+    const sid = agent.agent_session?.value || agent.agentSession?.value;
+    if (sid) prev.sessionId = sid;
+    if (agent.agent_status || agent.status) prev.status = agent.agent_status || agent.status;
+    byName.set(name, prev);
+    pending.delete(ev.toolUseId);
+  }
+  return [...byName.values()];
+}
+
+function herdrActionOf(parsed, inv) {
+  const id = String(parsed?.id || parsed?.result?.type || parsed?.type || "");
+  if (id.includes("agent:start") || id === "agent_started") return "start";
+  if (id.includes("agent:prompt") || id === "agent_prompted") return "prompt";
+  if (inv?.action) return inv.action;
+  return "";
+}
+
+/** `herdr agent start worker-1` / `herdr agent prompt worker-1 '…'` / hod dispatch. */
+export function parseHerdrAgentInvocation(text) {
+  const cmd = commandFromDetail(text);
+  if (!cmd) return null;
+  if (/\bherdr\s+agent\s+start\s+--help\b/.test(cmd)) return null;
+  if (/\bherdr\s+agent\s+prompt\s+--help\b/.test(cmd)) return null;
+  const hod = cmd.match(/\bhod\s+dispatch\s+start\b[\s\S]*?--name\s+(\S+)/);
+  if (hod) return { action: "start", name: stripQuotes(hod[1]), text: "" };
+  const start = cmd.match(/\bherdr\s+agent\s+start\s+(\S+)/);
+  if (start && !start[1].startsWith("-")) {
+    const kind = cmd.match(/--kind\s+(\S+)/);
+    return { action: "start", name: stripQuotes(start[1]), kind: kind ? stripQuotes(kind[1]) : "", text: "" };
+  }
+  const prompt = cmd.match(/\bherdr\s+agent\s+prompt\s+(\S+)\s+([\s\S]*)$/);
+  if (prompt && !prompt[1].startsWith("-")) {
+    return { action: "prompt", name: stripQuotes(prompt[1]), text: promptTextFromArgv(prompt[2]) };
+  }
+  return null;
+}
+
+export function parseHerdrCliJson(text) {
+  const raw = String(text || "");
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  if (!/cli:agent:(?:start|prompt)|agent_started|agent_prompted/.test(raw)) return null;
+  const slice = raw.slice(start);
+  try {
+    return JSON.parse(slice);
+  } catch { /* truncated tail output — pull the fields we still have */ }
+  const id = (slice.match(/"id"\s*:\s*"(cli:agent:(?:start|prompt))"/) || [])[1];
+  const err = (slice.match(/"error"\s*:\s*\{[^}]*"code"\s*:\s*"([^"]+)"/) || [])[1];
+  if (!id && !err) return null;
+  if (err) return { id: id || "cli:agent:start", error: { code: err } };
+  return {
+    id,
+    result: {
+      type: id === "cli:agent:start" ? "agent_started" : "agent_prompted",
+      agent: {
+        name: jsonField(slice, "name"),
+        pane_id: jsonField(slice, "pane_id"),
+        tab_id: jsonField(slice, "tab_id"),
+        agent: jsonField(slice, "agent"),
+        agent_status: jsonField(slice, "agent_status"),
+        cwd: jsonField(slice, "cwd"),
+        terminal_title_stripped: jsonField(slice, "terminal_title_stripped"),
+        terminal_title: jsonField(slice, "terminal_title"),
+      },
+    },
+  };
+}
+
+function commandFromDetail(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  try {
+    const j = JSON.parse(raw);
+    if (typeof j.command === "string") return j.command;
+  } catch { /* not a full JSON blob */ }
+  const m = raw.match(/"command"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (m) {
+    try { return JSON.parse(`"${m[1]}"`); } catch { return m[1]; }
+  }
+  return raw;
+}
+
+function promptTextFromArgv(rest) {
+  let s = String(rest || "").replace(/\s+--wait\b[\s\S]*$/, "").trim();
+  s = stripQuotes(s);
+  return s.replace(/\\n/g, " ").trim();
+}
+
+function stripQuotes(value) {
+  const s = String(value || "").trim();
+  if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function jsonField(text, key) {
+  const m = String(text || "").match(new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`));
+  return m ? m[1] : "";
 }
 
 function stillOnLivePane(s, agents) {
@@ -245,6 +541,22 @@ function stillOnLivePane(s, agents) {
   if (!occupant || occupant.sessionId) return false;
   return titlesMatch(s.meta.title, occupant.terminalTitle)
     && occupant.name === s.meta.team?.herdrName;
+}
+
+function replacedByDifferentLiveSession(s, agents) {
+  const team = s.meta.team;
+  if (!team) return false;
+  const bySession = agents.find((a) => a.sessionId && idsMatch(a.sessionId, s.meta.id));
+  if (bySession) return false;
+  const occupant = agents.find((a) => {
+    if (team.paneId && a.paneId === team.paneId) return true;
+    return Boolean(team.herdrName && a.name && a.name === team.herdrName);
+  });
+  if (!occupant) return false;
+  // A live spawn with a known session id that is not this transcript:
+  // this bind was pointing at the wrong chat.
+  if (occupant.sessionId && !idsMatch(occupant.sessionId, s.meta.id)) return true;
+  return false;
 }
 
 function titleKey(value) {

@@ -74,6 +74,7 @@
     es: null,
     pollTimer: null,
     sidebarLimit: 20,
+    detailFp: null,
   };
 
   // ---------- fetch ----------
@@ -105,7 +106,8 @@
       const j = await api(`/api/v1/sessions/${encodeURIComponent(id)}`);
       state.detail = j.session || null;
       state.lastUpdated = Date.now();
-      renderAll();
+      renderTopbar();
+      renderDetail();
     } catch { /* Keep the previous detail view. */ }
   }
 
@@ -134,11 +136,22 @@
         state.live = true;
         const d = JSON.parse(e.data);
         const idx = state.sessions.findIndex((s) => s?.meta?.id === d.id);
+        const prev = idx >= 0 ? state.sessions[idx] : null;
         const summary = { meta: d.meta, metrics: d.metrics, officeCounts: d.officeCounts || null };
         if (idx >= 0) state.sessions[idx] = summary;
         else state.sessions.unshift(summary);
-        if (state.selectedId === d.id) loadDetail(d.id);
-        renderAll();
+        const selected = state.selectedId === d.id;
+        const teammate = !selected && isSelectedTeammate(d);
+        if (selected || teammate) {
+          if (prev && sessionListSig(prev) === sessionListSig(summary)) return;
+          loadDetail(selected ? d.id : state.selectedId);
+          renderSidebar();
+          return;
+        }
+        if (!prev || sessionListSig(prev) !== sessionListSig(summary)) {
+          renderTopbar();
+          renderSidebar();
+        }
       });
       es.addEventListener("session.gone", (e) => {
         const d = JSON.parse(e.data);
@@ -242,6 +255,24 @@
       renderSidebar();
     }, { root, rootMargin: "80px" });
     io.observe(sent);
+  }
+
+  function sessionListSig(s) {
+    const m = s?.meta || {};
+    const t = m.team || {};
+    const c = s?.officeCounts || {};
+    return [
+      m.id, m.status, m.runtime, m.title, m.cwd,
+      t.id, t.herdrName, t.exited, t.herdrStatus,
+      s?.metrics?.toolCount, s?.metrics?.errorCount,
+      c.people, c.doing, c.blocked,
+    ].join("\0");
+  }
+
+  function isSelectedTeammate(d) {
+    const selected = state.sessions.find((s) => s?.meta?.id === state.selectedId);
+    const tid = selected?.meta?.team?.id;
+    return Boolean(tid && d?.meta?.team?.id === tid);
   }
 
   function groupSessions(list) {
@@ -383,15 +414,95 @@
   function renderDetail() {
     const wrap = $("#detail");
     if (state.tab !== "sessions" || !state.detail) {
+      state.detailFp = null;
+      if (graphSim) { graphSim.stop(); graphSim = null; }
+      graphMount = null;
       if (state.tab === "sessions" && !state.detail && !state.error) {
         wrap.innerHTML = `<div class="empty">Select a session from the sidebar…</div>`;
       }
       return;
     }
     const s = state.detail;
-    const m = s.meta, met = s.metrics;
     refreshInspected(s.office);
+    const fp = detailFingerprints(s);
+    const reuse = wrap.dataset.sid === s.meta.id && wrap.querySelector(".v-main-grid") && state.detailFp;
+    if (reuse) {
+      if (state.detailFp.head !== fp.head) replaceDetailHead(wrap, s);
+      const officeBox = wrap.querySelector(".office-panel-body");
+      const graphBox = wrap.querySelector(".graph-panel-body");
+      const heatBox = wrap.querySelector(".v-main-grid .v-panel-wrap:nth-child(3) > div:last-child");
+      const msgBox = wrap.querySelector(".v-main-grid .v-panel-wrap:nth-child(4) > div:last-child");
+      if (state.detailFp.office !== fp.office && officeBox) {
+        setPanelTitle(wrap, ".office-panel", officePanelTitle(s.office));
+        renderOffice(officeBox, s.office);
+      }
+      if (graphBox && state.detailFp.graph !== fp.graph) {
+        setPanelTitle(wrap, ".graph-panel", graphPanelTitle(s.office));
+        paintGraph(graphBox, s.graph, { compact: true });
+      } else {
+        applyGraphFocus();
+      }
+      if (heatBox && state.detailFp.heat !== fp.heat) {
+        const focus = forensicFocus(s.office);
+        setPanelTitle(wrap, ".v-panel-wrap:nth-child(3)", focus ? `Files · ${personLabel(focus)}` : "Files");
+        renderHeatmap(heatBox, focusedFiles(s.office, s.heatmap), { filtered: Boolean(focus) });
+      }
+      if (msgBox && state.detailFp.msg !== fp.msg) {
+        setPanelTitle(wrap, ".v-panel-wrap:nth-child(4)", `Messages (${s.messages.length})`);
+        renderMessageLog(msgBox, s.messages);
+      }
+      state.detailFp = fp;
+      return;
+    }
 
+    buildDetailShell(wrap, s);
+    state.detailFp = fp;
+  }
+
+  function detailFingerprints(s) {
+    return {
+      head: [
+        s.meta.id, s.meta.status, s.meta.title, s.meta.path,
+        s.metrics?.toolCount, s.metrics?.tokenTotal, s.metrics?.durationMs,
+        s.metrics?.fileCount, s.metrics?.errorCount,
+      ].join("\0"),
+      office: officeFingerprint(s.office),
+      graph: graphTopologyKey(s.graph) + "\n" + graphPaintKey(s.graph),
+      heat: focusedFiles(s.office, s.heatmap).map((f) => `${f.path}:${f.total}`).join("\n"),
+      msg: `${s.messages.length}\0${s.messages.at(-1)?.id || ""}`,
+    };
+  }
+
+  function officeFingerprint(office) {
+    const people = (office?.people || []).map((p) => [
+      p.id, p.status, p.herdrName, p.exited, p.currentWork, p.errorCount,
+      (p.tasks || []).map((t) => t.title).join(","),
+      (p.assignments || []).map((a) => a.task).join(","),
+    ].join("|"));
+    return `${state.focusedPerson || ""}\0${office?.counts?.people || 0}\0${people.join(";")}`;
+  }
+
+  function graphPanelTitle(office) {
+    const focus = forensicFocus(office);
+    return focus
+      ? `Forensics · Execution Graph · ${personLabel(focus)}`
+      : "Forensics · Execution Graph";
+  }
+
+  function setPanelTitle(wrap, sel, title) {
+    const node = wrap.querySelector(`${sel} .v-panel-title`);
+    if (node) node.textContent = title;
+  }
+
+  function replaceDetailHead(wrap, s) {
+    const prev = wrap.querySelector(".detail-head");
+    const next = buildDetailHead(s);
+    if (prev) prev.replaceWith(next);
+    else wrap.prepend(next);
+  }
+
+  function buildDetailHead(s) {
+    const m = s.meta, met = s.metrics;
     const head = el("div", "detail-head");
     const hLeft = el("div");
     const h2 = el("h2");
@@ -422,8 +533,13 @@
     if (met.errorCount) errSpan.style.color = "var(--red)";
     stats.appendChild(errSpan);
     head.appendChild(stats);
+    return head;
+  }
+
+  function buildDetailShell(wrap, s) {
+    wrap.dataset.sid = s.meta.id;
     wrap.innerHTML = "";
-    wrap.appendChild(head);
+    wrap.appendChild(buildDetailHead(s));
 
     const grid = el("div", "v-main-grid");
     const mkPanel = (title, className = "") => {
@@ -436,26 +552,16 @@
     };
 
     const officeBox = mkPanel(officePanelTitle(s.office), "office-panel");
+    const graphBox = mkPanel(graphPanelTitle(s.office), "graph-panel");
     const focus = forensicFocus(s.office);
-    const graphBox = mkPanel(
-      focus ? `Forensics · Execution Graph · ${personLabel(focus)}` : "Forensics · Execution Graph",
-      "graph-panel",
-    );
-    const heatTitle = focus ? `Files · ${personLabel(focus)}` : "Files";
-    const heatBox = mkPanel(heatTitle);
+    const heatBox = mkPanel(focus ? `Files · ${personLabel(focus)}` : "Files");
     const msgBox = mkPanel(`Messages (${s.messages.length})`);
     wrap.appendChild(grid);
 
     renderOffice(officeBox, s.office);
-    const files = focusedFiles(s.office, s.heatmap);
-    renderHeatmap(heatBox, files, { filtered: Boolean(focus) });
+    renderHeatmap(heatBox, focusedFiles(s.office, s.heatmap), { filtered: Boolean(focus) });
     renderMessageLog(msgBox, s.messages);
-    try {
-      renderGraph(graphBox, s.graph, { compact: true });
-    } catch (err) {
-      console.error("Graph render failed", err);
-      renderStaticGraph(graphBox, s.graph);
-    }
+    paintGraph(graphBox, s.graph, { compact: true });
   }
 
   function officePanelTitle(office) {
@@ -545,13 +651,15 @@
     if (state.inspected?.inspect === "person" || state.inspected?.inspect === "artifact") {
       state.inspected = null;
     }
-    renderAll();
+    renderDetail();
+    renderInspector();
   }
 
   function focusPerson(person) {
     state.focusedPerson = person.id;
     state.inspected = { inspect: "person", ...person };
-    renderAll();
+    renderDetail();
+    renderInspector();
   }
 
   function inspectArtifact(art) {
@@ -759,6 +867,10 @@
       card.appendChild(el("div", "office-desk-work", displayWork(person.currentWork) || "Idle"));
     }
 
+    if (person.exited) {
+      card.appendChild(el("div", "office-desk-meta", "offline"));
+      card.classList.add("is-offline");
+    }
     if (person.errorCount) {
       card.appendChild(el("div", "office-desk-meta office-err", `${person.errorCount} err`));
     }
@@ -783,6 +895,7 @@
 
   function renderAssignGroups(assigns, { full = false } = {}) {
     const box = el("div", "office-assigns");
+    if (!full) box.addEventListener("wheel", (evt) => evt.stopPropagation(), { passive: true });
     for (const g of groupAssigns(assigns)) {
       const group = el("div", "office-assign-group");
       if (g.who) group.appendChild(el("span", "office-assign-who", g.who));
@@ -840,6 +953,7 @@
     "session_root", "user_prompt", "agent_message", "tool_call", "error", "subagent_start",
   ]);
   let graphSim = null;
+  let graphMount = null;
 
   function graphNodeId(value) {
     return typeof value === "object" ? value?.id : value;
@@ -921,9 +1035,86 @@
     box.appendChild(legend);
   }
 
+  function graphTopologyKey(graph) {
+    const g = simplifyGraph(graph);
+    return [
+      g.nodes.map((n) => n.id).sort().join("\n"),
+      g.links.map((l) => `${graphNodeId(l.source)}\t${graphNodeId(l.target)}`).sort().join("\n"),
+    ].join("\n#\n");
+  }
+
+  function graphPaintKey(graph) {
+    const g = simplifyGraph(graph);
+    return g.nodes
+      .map((n) => `${n.id}\t${n.kind}\t${n.status || ""}\t${(n.label || "").slice(0, 30)}`)
+      .sort()
+      .join("\n");
+  }
+
+  function applyGraphFocus() {
+    if (!graphMount?.nodeEls) return;
+    const focusIds = focusedEventIds();
+    for (const { g, n } of graphMount.nodeEls) {
+      g.classList.toggle("is-dim", Boolean(focusIds && !nodeBelongsToFocus(n, focusIds)));
+    }
+  }
+
+  function paintGraphNodes() {
+    if (!graphMount?.nodeEls) return;
+    const focusIds = focusedEventIds();
+    for (const { g, n, circle, text } of graphMount.nodeEls) {
+      circle.setAttribute("fill", KIND_COLOR[n.kind] || "#8b949e");
+      circle.style.animation = n.status === "running" ? "pulse 1.4s infinite" : "";
+      text.textContent = (n.label || n.id).slice(0, 30);
+      g.classList.toggle("is-dim", Boolean(focusIds && !nodeBelongsToFocus(n, focusIds)));
+    }
+  }
+
+  function paintGraph(box, graph, opts = {}) {
+    try {
+      renderGraph(box, graph, opts);
+    } catch (err) {
+      console.error("Graph render failed", err);
+      graphMount = null;
+      renderStaticGraph(box, graph);
+    }
+  }
+
   function renderGraph(box, graph, opts = {}) {
-    box.innerHTML = "";
     const displayGraph = simplifyGraph(graph);
+    const topologyKey = graphTopologyKey(graph);
+    const paintKey = graphPaintKey(graph);
+    if (
+      graphMount
+      && graphMount.box === box
+      && graphMount.topologyKey === topologyKey
+      && box.contains(graphMount.wrap)
+    ) {
+      if (graphMount.paintKey !== paintKey) {
+        const byId = new Map(displayGraph.nodes.map((n) => [n.id, n]));
+        for (const rec of graphMount.nodeEls) {
+          const fresh = byId.get(rec.n.id);
+          if (fresh) Object.assign(rec.n, { kind: fresh.kind, status: fresh.status, label: fresh.label });
+        }
+        graphMount.paintKey = paintKey;
+        paintGraphNodes();
+      } else {
+        applyGraphFocus();
+      }
+      return;
+    }
+
+    const prevPos = new Map();
+    if (graphMount?.nodes) {
+      for (const n of graphMount.nodes) {
+        if (n.id != null && n.x != null) prevPos.set(n.id, { x: n.x, y: n.y });
+      }
+    }
+    if (graphSim) graphSim.stop();
+    graphSim = null;
+    graphMount = null;
+
+    box.innerHTML = "";
     addGraphLegend(box);
     const wrap = el("div", `graph-wrap${opts.compact ? " graph-wrap-forensics" : ""}`);
     box.appendChild(wrap);
@@ -938,11 +1129,18 @@
 
     const nodes = displayGraph.nodes;
     const links = displayGraph.links;
+    for (const n of nodes) {
+      const pos = prevPos.get(n.id);
+      if (pos) { n.x = pos.x; n.y = pos.y; }
+    }
+    const reused = prevPos.size > 0 && nodes.some((n) => prevPos.has(n.id));
     const sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(links).id((d) => d.id).distance(50).strength(0.5))
       .force("charge", d3.forceManyBody().strength(-240))
       .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collide", d3.forceCollide(24));
+      .force("collide", d3.forceCollide(24))
+      .alpha(reused ? 0.18 : 1)
+      .alphaDecay(0.08);
 
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
     svg.appendChild(g);
@@ -1016,7 +1214,7 @@
         if (!wasMoved) { state.inspected = n; renderInspector(); }
       });
       g.appendChild(gn);
-      nodeEls.push({ g: gn, n });
+      nodeEls.push({ g: gn, n, circle: c, text: t });
     });
 
     const lineEls = [];
@@ -1041,8 +1239,13 @@
         gn.setAttribute("transform", `translate(${n.x ?? 0},${n.y ?? 0})`);
       });
     });
-    if (graphSim) graphSim.stop();
+    sim.on("end", () => {
+      if (graphSim === sim) sim.stop();
+    });
     graphSim = sim;
+    graphMount = {
+      box, wrap, topologyKey, paintKey, nodes, links, nodeEls, lineEls, sim,
+    };
   }
 
   function focusedEventIds() {
