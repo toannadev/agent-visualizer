@@ -1,6 +1,8 @@
 // Visualizer logic — PURE (no IO). Build graph/timeline/heatmap/messages/metrics
 // from VisualEvent[]. The realtime server imports this module; the client only renders results.
 
+import { buildOffice } from "./office.mjs";
+
 // ---------- graph ----------
 
 export function buildGraph(events) {
@@ -256,5 +258,6 @@ export function recompute(events) {
     heatmap: buildHeatmap(events),
     messages: buildMessages(events),
     metrics: buildMetrics(events),
+    office: buildOffice(events),
   };
 }

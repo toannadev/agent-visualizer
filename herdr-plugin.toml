@@ -1,0 +1,24 @@
+id = "agent.visualizer"
+name = "Agent Visualizer"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Office floor, execution graph, and file heatmap for Claude, Grok, and Codex sessions in this Herdr workspace."
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["npm", "ci"]
+
+[[build]]
+command = ["npm", "run", "build"]
+
+[[actions]]
+id = "open"
+title = "Open Agent Visualizer"
+contexts = ["workspace"]
+command = ["node", "plugin/open.mjs"]
+
+[[panes]]
+id = "agent-visualizer"
+title = "Agent Visualizer"
+placement = "split"
+command = ["node", "bin/visualizer.mjs"]

@@ -12,7 +12,9 @@
     "public/",
     "scripts/",
     "SKILL.md",
-    "README.md"
+    "README.md",
+    "herdr-plugin.toml",
+    "plugin/"
   ],
   "engines": {
     "node": ">=18"
@@ -23,7 +25,9 @@
     "prepublishOnly": "node scripts/bundle-d3.mjs",
     "postinstall": "node bin/visualizer.mjs install-skill",
     "start": "node bin/visualizer.mjs",
-    "patch-hooks": "node scripts/patch-hooks.mjs"
+    "test": "node --test server/*.test.mjs",
+    "patch-hooks": "node scripts/patch-hooks.mjs",
+    "herdr:link": "node bin/visualizer.mjs herdr-link"
   },
   "dependencies": {},
   "devDependencies": {

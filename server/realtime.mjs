@@ -8,6 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { recompute } from "./visual.mjs";
+import { emptyOffice, mergeTeamView, applyAssignedRole } from "./office.mjs";
+import { ASSIGNABLE_ROLES, canonicalizeRole, roleFromAgentName } from "./roles.mjs";
+import { readHerdrSnapshot, attachHerdrTeams } from "./herdr.mjs";
 import { findRolloutPaths, readCodexRollout, readCodexRolloutFull, sessionIdFromPath } from "./codex.mjs";
 import { readTranscript, redactString } from "./transcript.mjs";
 import {
@@ -78,6 +81,7 @@ function seedSession(runtime, id, { cwd = "", filePath = "", title = "", model =
     },
     events: [], graph: { nodes: [], links: [] }, timeline: [], heatmap: [], messages: [],
     metrics: { toolCount: 0, tokenTotal: 0, durationMs: 0, errorCount: 0, fileCount: 0 },
+    office: emptyOffice(),
   };
 }
 
@@ -88,7 +92,14 @@ function recomputeSession(s) {
   s.heatmap = d.heatmap;
   s.messages = d.messages;
   s.metrics = d.metrics;
+  s.office = d.office;
   return s;
+}
+
+function teammates(s) {
+  const tid = s?.meta?.team?.id;
+  if (!tid) return [s];
+  return [...sessions.values()].filter((x) => x?.meta?.team?.id === tid);
 }
 
 function pushEvent(s, ev) {
@@ -111,7 +122,7 @@ function safeStatSize(p) {
 function emitUpsert(id) {
   const s = sessions.get(id);
   if (!s) return;
-  broadcast("session.upsert", { id, meta: s.meta, metrics: s.metrics, events: s.events.slice(-20) });
+  broadcast("session.upsert", { id, meta: s.meta, metrics: s.metrics, officeCounts: s.office?.counts || null, events: s.events.slice(-20) });
 }
 
 // ---------- Claude hook ingestion ----------
@@ -152,13 +163,13 @@ function hookToVisualEvent(b, seq, sid) {
     case "PreToolUse":
       return {
         ...base, kind: "tool_call", id: `ht${seq}`, turnId: b.prompt_id, toolUseId: b.tool_use_id,
-        toolName: b.tool_name, label: b.tool_name, detail: redactString(JSON.stringify(b.tool_input || {}).slice(0, 600)),
+        toolName: b.tool_name, label: b.tool_name, detail: redactString(JSON.stringify(b.tool_input || {}).slice(0, 4000)),
         filePaths: fileRefsFromHook(b),
       };
     case "PostToolUse":
       return {
         ...base, kind: "tool_output", id: `ho${seq}`, turnId: b.prompt_id, toolUseId: b.tool_use_id,
-        toolName: b.tool_name, label: `✓ ${b.tool_name}`, detail: redactString(String(b.tool_response || "").slice(0, 500)),
+        toolName: b.tool_name, label: `✓ ${b.tool_name}`, detail: redactString(String(b.tool_response || "").slice(0, 8000)),
       };
     case "PostToolUseFailure":
       return {
@@ -519,6 +530,13 @@ function tailTick() {
 
   // 3) Grok sessions (updates.jsonl)
   for (const fp of findGrokUpdatePaths()) tailFile(fp, "grok");
+
+  // 4) Join sessions that share a live Herdr tab (Claude giao / Grok nhận).
+  const snap = readHerdrSnapshot();
+  if (snap.ok) {
+    const herdrChanged = attachHerdrTeams([...sessions.values()], snap.agents, { live: true });
+    for (const id of herdrChanged) emitUpsert(id);
+  }
 }
 
 function tailFile(filePath, runtime) {
@@ -584,6 +602,24 @@ function tailFile(filePath, runtime) {
   }
 }
 
+function claudeUserText(obj) {
+  const content = obj?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+function isClaudeHumanPrompt(obj) {
+  if (obj?.type !== "user" || obj.isMeta) return false;
+  if (obj.promptSource && obj.promptSource !== "typed") return false;
+  if (obj.origin?.kind && obj.origin.kind !== "human") return false;
+  return Boolean(claudeUserText(obj));
+}
+
 // Claude tail — parse new transcript lines into VisualEvents (simpler than hooks).
 function ingestClaudeLine(obj, filePath, seq, sid) {
   let s = sessions.get(sid) || seedSession("claude", sid, { filePath });
@@ -592,8 +628,13 @@ function ingestClaudeLine(obj, filePath, seq, sid) {
   const base = { runtime: "claude", sessionId: sid, ts, seq, parentId: obj.parentUuid || null };
   let ev = null;
 
-  if (obj.type === "user" && obj.promptSource === "typed" && !obj.isMeta && typeof obj.message?.content === "string") {
-    ev = { ...base, kind: "user_prompt", id: `tu${seq}`, turnId: obj.promptId || obj.uuid, label: obj.message.content.slice(0, 140), detail: obj.message.content };
+  if (isClaudeHumanPrompt(obj)) {
+    const text = claudeUserText(obj);
+    ev = {
+      ...base, kind: "user_prompt", id: `tu${seq}`,
+      turnId: obj.promptId || obj.uuid,
+      label: text.slice(0, 140), detail: text,
+    };
   } else if (obj.type === "assistant" && Array.isArray(obj.message?.content)) {
     for (const b of obj.message.content) {
       if (b?.type === "thinking") ev = { ...base, kind: "reasoning", id: `tth${seq}`, turnId: obj.parentUuid, label: "🧠 reasoning", detail: String(b.thinking || "").slice(0, 500) };
@@ -604,7 +645,7 @@ function ingestClaudeLine(obj, filePath, seq, sid) {
     for (const b of obj.message.content) {
       if (b?.type === "tool_result") {
         const txt = typeof b.content === "string" ? b.content : Array.isArray(b.content) ? b.content.map((c) => c?.text || "").join("\n") : "";
-        ev = { ...base, kind: b.is_error ? "tool_error" : "tool_output", id: `ttr${seq}`, turnId: obj.parentUuid, toolUseId: b.tool_use_id, label: b.is_error ? "✗" : "✓", detail: txt.slice(0, 500), error: b.is_error ? txt.slice(0, 300) : undefined };
+        ev = { ...base, kind: b.is_error ? "tool_error" : "tool_output", id: `ttr${seq}`, turnId: obj.parentUuid, toolUseId: b.tool_use_id, label: b.is_error ? "✗" : "✓", detail: txt.slice(0, 8000), error: b.is_error ? txt.slice(0, 300) : undefined };
       }
     }
   } else if (obj.type === "system" && obj.subtype === "turn_duration") {
@@ -663,9 +704,31 @@ const server = http.createServer(async (req, res) => {
 
     if (p === "/api/v1/sessions" && req.method === "GET") {
       const out = [...sessions.values()]
-        .map((s) => ({ meta: s.meta, metrics: s.metrics }))
+        .map((s) => ({ meta: s.meta, metrics: s.metrics, officeCounts: s.office?.counts || null }))
         .sort((a, b) => (b.meta?.mtimeMs || 0) - (a.meta?.mtimeMs || 0));
       return sendJson(res, 200, { sessions: out });
+    }
+
+    if (p.startsWith("/api/v1/sessions/") && p.endsWith("/role") && req.method === "POST") {
+      const id = decodeURIComponent(p.slice("/api/v1/sessions/".length, p.length - "/role".length));
+      const s = sessions.get(id);
+      if (!s) return sendJson(res, 404, { error: "not found" });
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        try {
+          const role = canonicalizeRole(JSON.parse(body || "{}").role);
+          if (!role || !ASSIGNABLE_ROLES.includes(role)) {
+            return sendJson(res, 400, { error: "invalid role", roles: ASSIGNABLE_ROLES });
+          }
+          s.meta.roleOverride = role;
+          emitUpsert(id);
+          return sendJson(res, 200, { ok: true, id, role });
+        } catch (err) {
+          return sendJson(res, 400, { error: String(err) });
+        }
+      });
+      return;
     }
 
     if (p.startsWith("/api/v1/sessions/")) {
@@ -674,6 +737,22 @@ const server = http.createServer(async (req, res) => {
       if (!s) return sendJson(res, 404, { error: "not found" });
       // Cap events sent to avoid oversized payloads.
       const sCopy = { ...s, events: s.events.slice(-2000) };
+      const team = teammates(s);
+      if (team.length >= 2) {
+        const view = mergeTeamView(team);
+        sCopy.office = view.office;
+        sCopy.heatmap = view.heatmap;
+        if (view.graph) sCopy.graph = view.graph;
+      } else {
+        const override = s.meta.roleOverride;
+        const hod = s.meta.team?.hodRole;
+        const named = roleFromAgentName(s.meta.team?.herdrName);
+        if (override || hod || named) {
+          sCopy.office = applyAssignedRole(s.office, override || hod || named, {
+            source: override ? "user" : hod ? "hod" : "name",
+          });
+        }
+      }
       return sendJson(res, 200, { session: sCopy });
     }
 
