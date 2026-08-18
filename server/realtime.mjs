@@ -163,13 +163,13 @@ function hookToVisualEvent(b, seq, sid) {
     case "PreToolUse":
       return {
         ...base, kind: "tool_call", id: `ht${seq}`, turnId: b.prompt_id, toolUseId: b.tool_use_id,
-        toolName: b.tool_name, label: b.tool_name, detail: redactString(JSON.stringify(b.tool_input || {}).slice(0, 600)),
+        toolName: b.tool_name, label: b.tool_name, detail: redactString(JSON.stringify(b.tool_input || {}).slice(0, 4000)),
         filePaths: fileRefsFromHook(b),
       };
     case "PostToolUse":
       return {
         ...base, kind: "tool_output", id: `ho${seq}`, turnId: b.prompt_id, toolUseId: b.tool_use_id,
-        toolName: b.tool_name, label: `✓ ${b.tool_name}`, detail: redactString(String(b.tool_response || "").slice(0, 500)),
+        toolName: b.tool_name, label: `✓ ${b.tool_name}`, detail: redactString(String(b.tool_response || "").slice(0, 8000)),
       };
     case "PostToolUseFailure":
       return {
@@ -645,7 +645,7 @@ function ingestClaudeLine(obj, filePath, seq, sid) {
     for (const b of obj.message.content) {
       if (b?.type === "tool_result") {
         const txt = typeof b.content === "string" ? b.content : Array.isArray(b.content) ? b.content.map((c) => c?.text || "").join("\n") : "";
-        ev = { ...base, kind: b.is_error ? "tool_error" : "tool_output", id: `ttr${seq}`, turnId: obj.parentUuid, toolUseId: b.tool_use_id, label: b.is_error ? "✗" : "✓", detail: txt.slice(0, 500), error: b.is_error ? txt.slice(0, 300) : undefined };
+        ev = { ...base, kind: b.is_error ? "tool_error" : "tool_output", id: `ttr${seq}`, turnId: obj.parentUuid, toolUseId: b.tool_use_id, label: b.is_error ? "✗" : "✓", detail: txt.slice(0, 8000), error: b.is_error ? txt.slice(0, 300) : undefined };
       }
     }
   } else if (obj.type === "system" && obj.subtype === "turn_duration") {
